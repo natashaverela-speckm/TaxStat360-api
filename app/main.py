@@ -1,4 +1,4 @@
-import json,os,hashlib,secrets,stripe,requests
+import json,os,hashlib,secrets,stripe,requests,boto3,time
 from fastapi import FastAPI,HTTPException,Request,Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
@@ -98,9 +98,29 @@ def register(r:Reg, request:Request):
     if r.email in u:raise HTTPException(400,"Email already registered")
     plan = r.plan if r.plan in VALID_PLANS else "starter"
     tok=secrets.token_hex(32)
-    u[r.email]={"name":r.name,"pw":hashlib.sha256(r.password.encode()).hexdigest(),"tok":tok,"plan":plan,"stripe_customer_id":""}
+    verify_tok=secrets.token_hex(32)
+    u[r.email]={"name":r.name,"pw":hashlib.sha256(r.password.encode()).hexdigest(),"tok":tok,"plan":plan,"stripe_customer_id":"","verified":False,"verify_tok":verify_tok}
     save(u)
     mc_subscribe(r.email,r.name)
+    # Send verification email
+    try:
+        ses = boto3.client("ses", region_name="us-east-1")
+        verify_url = f"https://app.taxstat360.com/auth/verify-email?token={verify_tok}&email={r.email}"
+        ses.send_email(
+            Source="admin@taxstat360.com",
+            Destination={"ToAddresses": [r.email]},
+            Message={
+                "Subject": {"Data": "Verify your TaxStat360 email"},
+                "Body": {"Html": {"Data": f"""
+                    <p>Hi {r.name},</p>
+                    <p>Thanks for signing up for TaxStat360. Click below to verify your email address:</p>
+                    <p><a href="{verify_url}">Verify my email</a></p>
+                    <p>— TaxStat360</p>
+                """}}
+            }
+        )
+    except Exception as e:
+        print(f"SES verify error: {e}")
     return {"access_token":tok}
 
 @app.post("/auth/login")
@@ -110,7 +130,11 @@ def login(r:Log, request:Request):
     x=u.get(r.email)
     if not x or x["pw"]!=hashlib.sha256(r.password.encode()).hexdigest():
         raise HTTPException(401,"Invalid email or password")
-    return {"access_token":x["tok"],"plan":x.get("plan","starter")}
+    # Rotate token on every login — invalidates any previously stolen tokens
+    new_tok = secrets.token_hex(32)
+    u[r.email]["tok"] = new_tok
+    save(u)
+    return {"access_token":new_tok,"plan":x.get("plan","starter")}
 
 @app.get("/user/me")
 def me(user=Depends(get_user_from_token)):
@@ -168,6 +192,78 @@ def callback(p:str,code:str="",state:str=""):
     return RedirectResponse(url=f"https://www.taxstat360.com/dashboard?{p}=connected")
 
 WEBHOOK_SECRET=os.environ.get("STRIPE_WEBHOOK_SECRET","")
+
+
+class ForgotPw(BaseModel):
+    email: str
+
+class ResetPw(BaseModel):
+    email: str
+    token: str
+    new_password: str
+
+
+@app.get("/auth/verify-email")
+def verify_email(token:str="", email:str=""):
+    u=load()
+    x=u.get(email)
+    if not x or x.get("verify_tok") != token:
+        raise HTTPException(400, "Invalid or expired verification link")
+    u[email]["verified"] = True
+    u[email].pop("verify_tok", None)
+    save(u)
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="https://www.taxstat360.com/onboarding/entity?verified=true")
+
+@app.post("/auth/forgot-password")
+@limiter.limit("3/minute")
+def forgot_password(r:ForgotPw, request:Request):
+    # SECURITY: always return success to prevent email enumeration
+    u=load()
+    x=u.get(r.email)
+    if x:
+        reset_tok = secrets.token_hex(32)
+        u[r.email]["reset_tok"] = reset_tok
+        u[r.email]["reset_exp"] = int(time.time()) + 3600  # 1 hour
+        save(u)
+        try:
+            ses = boto3.client("ses", region_name="us-east-1")
+            reset_url = f"https://www.taxstat360.com/reset-password?token={reset_tok}&email={r.email}"
+            ses.send_email(
+                Source="admin@taxstat360.com",
+                Destination={"ToAddresses": [r.email]},
+                Message={
+                    "Subject": {"Data": "Reset your TaxStat360 password"},
+                    "Body": {"Html": {"Data": f"""
+                        <p>Hi,</p>
+                        <p>Click the link below to reset your TaxStat360 password. This link expires in 1 hour.</p>
+                        <p><a href="{reset_url}">Reset my password</a></p>
+                        <p>If you did not request this, ignore this email.</p>
+                        <p>— TaxStat360</p>
+                    """}}
+                }
+            )
+        except Exception as e:
+            print(f"SES error: {e}")
+    return {"ok": True, "message": "If that email is registered, a reset link has been sent."}
+
+@app.post("/auth/reset-password")
+def reset_password(r:ResetPw):
+    u=load()
+    x=u.get(r.email)
+    if not x:
+        raise HTTPException(400, "Invalid or expired reset link")
+    if x.get("reset_tok") != r.token:
+        raise HTTPException(400, "Invalid or expired reset link")
+    if int(time.time()) > x.get("reset_exp", 0):
+        raise HTTPException(400, "Reset link has expired — please request a new one")
+    # Valid — update password and clear reset token
+    u[r.email]["pw"] = hashlib.sha256(r.new_password.encode()).hexdigest()
+    u[r.email]["tok"] = secrets.token_hex(32)  # invalidate all sessions
+    u[r.email].pop("reset_tok", None)
+    u[r.email].pop("reset_exp", None)
+    save(u)
+    return {"ok": True, "message": "Password updated successfully. Please log in with your new password."}
 
 @app.post("/stripe/webhook")
 async def stripe_webhook(request:Request):
