@@ -306,3 +306,80 @@ async def stripe_webhook(request:Request):
                 print(f"Payment failed for {email}")
                 break
     return {"status":"ok"}
+
+
+from urllib.parse import quote   # used to encode the email in the reset link below
+
+FRONTEND_URL = "https://www.taxstat360.com"   # where the React app (reset-password page) lives
+RESET_FROM   = "noreply@taxstat360.com"       # MUST be a verified SES identity (you verified this one)
+RESET_TTL    = 3600                            # reset link valid for 1 hour (seconds)
+
+
+class ForgotReq(BaseModel):
+    email: str
+
+
+class ResetReq(BaseModel):
+    email: str
+    token: str
+    new_password: str
+
+
+@app.post("/auth/forgot-password")
+@limiter.limit("3/minute")
+def forgot_password(r: ForgotReq, request: Request):
+    u = load()
+    x = u.get(r.email)
+    if x:
+        reset_tok = secrets.token_hex(32)
+        x["reset_tok"] = reset_tok
+        x["reset_exp"] = int(time.time()) + RESET_TTL
+        u[r.email] = x
+        save(u)
+        try:
+            reset_url = f"{FRONTEND_URL}/reset-password?token={reset_tok}&email={quote(r.email)}"
+            ses = boto3.client("ses", region_name="us-east-1")
+            ses.send_email(
+                Source=RESET_FROM,
+                Destination={"ToAddresses": [r.email]},
+                Message={
+                    "Subject": {"Data": "Reset your TaxStat360 password"},
+                    "Body": {"Html": {"Data":
+                        '<div style="font-family:-apple-system,sans-serif;max-width:520px;'
+                        'margin:0 auto;padding:40px 24px">'
+                        '<h2 style="color:#0D1B3E">Reset your password</h2>'
+                        '<p>We received a request to reset your TaxStat360 password. '
+                        'This link expires in 1 hour.</p>'
+                        f'<p><a href="{reset_url}" style="background:#2563EB;color:#fff;'
+                        'padding:12px 20px;border-radius:8px;text-decoration:none;'
+                        'display:inline-block">Reset Password</a></p>'
+                        '<p style="color:#475569;font-size:13px">If you did not request this, '
+                        'you can safely ignore this email.</p>'
+                        '</div>'
+                    }},
+                },
+            )
+        except Exception as e:
+            print("password reset email failed:", e)
+    return {"ok": True}
+
+
+@app.post("/auth/reset-password")
+@limiter.limit("5/minute")
+def reset_password(r: ResetReq, request: Request):
+    u = load()
+    x = u.get(r.email)
+    if (not x
+            or not x.get("reset_tok")
+            or not secrets.compare_digest(x.get("reset_tok", ""), r.token)
+            or x.get("reset_exp", 0) < int(time.time())):
+        raise HTTPException(400, "Invalid or expired reset link")
+    if not (12 <= len(r.new_password) <= 128):
+        raise HTTPException(400, "Password must be between 12 and 128 characters")
+    x["pw"] = hashlib.sha256(r.new_password.encode()).hexdigest()
+    x.pop("reset_tok", None)
+    x.pop("reset_exp", None)
+    x["tok"] = secrets.token_hex(32)
+    u[r.email] = x
+    save(u)
+    return {"ok": True}
