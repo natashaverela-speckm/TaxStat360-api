@@ -269,11 +269,12 @@ def reset_password(r:ResetPw):
 async def stripe_webhook(request:Request):
     payload=await request.body()
     sig=request.headers.get("stripe-signature","")
+    import json as _json
     try:
         if WEBHOOK_SECRET:
-            event=stripe.Webhook.construct_event(payload,sig,WEBHOOK_SECRET)
+            stripe.Webhook.construct_event(payload,sig,WEBHOOK_SECRET)
+            event=_json.loads(payload)
         else:
-            import json as _json
             event=_json.loads(payload)
     except Exception as e:
         raise HTTPException(400,str(e))
