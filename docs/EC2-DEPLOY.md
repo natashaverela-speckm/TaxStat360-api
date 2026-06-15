@@ -7,7 +7,10 @@ GitHub `taxstat360-api` is the source of truth after each deploy.
 
 - AWS Session Manager access to the EC2 instance
 - `taxstat360-users` DynamoDB table exists (on-demand, encryption on)
-- EC2 role `TaxStat360-EC2-SSM-Role` has: `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Scan`, `DescribeTable` on `taxstat360-users`
+- `taxstat360-records` DynamoDB table exists (PK `userId` String, SK `recordId` Number, on-demand, encryption on)
+- EC2 role `TaxStat360-EC2-SSM-Role` has DynamoDB access:
+  - **Users:** `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Scan`, `DescribeTable` on `taxstat360-users`
+  - **Records:** `GetItem`, `PutItem`, `DeleteItem`, `Query`, `DescribeTable` on `taxstat360-records`
 - `.env` on server includes `SECRET_KEY`, `SENDGRID_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`
 
 ## 1. Backup (always first)
@@ -68,6 +71,26 @@ curl -s -b /tmp/ts360.txt "http://127.0.0.1:8000/auth/me"
 ```
 
 Expected: first call `401`; register `{"ok":true,...}`; `/auth/me` returns email + plan.
+
+### M2 records smoke test (session cookie)
+
+```bash
+TS=$(date +%Y%m%d_%H%M%S)
+EMAIL="recordtest${TS}@example.com"
+PASS="TestPassword123!"
+
+curl -s -c /tmp/ts360.txt -X POST "http://127.0.0.1:8000/auth/register" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\":\"Record Test\",\"email\":\"$EMAIL\",\"password\":\"$PASS\",\"plan\":\"starter\"}"
+
+curl -s -b /tmp/ts360.txt -X PUT "http://127.0.0.1:8000/records" \
+  -H "Content-Type: application/json" \
+  -d "{\"id\":1234567890,\"name\":\"Test record\",\"savedAt\":\"Jun 15 2026\"}"
+
+curl -s -b /tmp/ts360.txt "http://127.0.0.1:8000/records"
+```
+
+Expected: PUT returns the record with `updatedAt`; GET returns a one-item array.
 
 ## 6. Sync to GitHub
 
