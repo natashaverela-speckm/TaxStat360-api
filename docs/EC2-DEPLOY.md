@@ -1,0 +1,87 @@
+# Milestone 1 — EC2 backend deploy runbook
+
+Manual deploy for `/home/ubuntu/risk-planner-BE/app/main.py` on the TaxStat360 EC2 instance.
+GitHub `taxstat360-api` is the source of truth after each deploy.
+
+## Prerequisites
+
+- AWS Session Manager access to the EC2 instance
+- `taxstat360-users` DynamoDB table exists (on-demand, encryption on)
+- EC2 role `TaxStat360-EC2-SSM-Role` has: `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Scan`, `DescribeTable` on `taxstat360-users`
+- `.env` on server includes `SECRET_KEY`, `SENDGRID_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`
+
+## 1. Backup (always first)
+
+```bash
+TS=$(date +%Y%m%d_%H%M%S)
+sudo mkdir -p /home/ubuntu/backups
+sudo cp /home/ubuntu/risk-planner-BE/app/main.py /home/ubuntu/backups/taxstat360_${TS}_main.py
+sudo cp /home/ubuntu/risk-planner-BE/users.json /home/ubuntu/backups/taxstat360_${TS}_users.json 2>/dev/null || true
+echo "Backup TS=$TS"
+```
+
+## 2. Deploy code
+
+**Option A — from GitHub (after merging to `main`):**
+
+```bash
+cd /home/ubuntu/risk-planner-BE
+sudo -u ubuntu git pull origin main   # only if repo is cloned here; skip if hand-copying
+```
+
+**Option B — copy `app/main.py` via Session Manager** (paste or upload), then:
+
+```bash
+sudo chown ubuntu:ubuntu /home/ubuntu/risk-planner-BE/app/main.py
+```
+
+## 3. Syntax check
+
+```bash
+sudo -u ubuntu /home/ubuntu/risk-planner-BE/venv/bin/python3 -m py_compile /home/ubuntu/risk-planner-BE/app/main.py && echo "py_compile OK"
+sudo -u ubuntu bash -c 'cd /home/ubuntu/risk-planner-BE && ./venv/bin/python3 -c "from app.main import app; print(\"IMPORT_OK\")"'
+```
+
+## 4. Restart service
+
+```bash
+sudo systemctl restart taxstat360.service
+sleep 2
+sudo systemctl is-active taxstat360.service
+```
+
+Do **not** leave the service stopped.
+
+## 5. Smoke tests
+
+```bash
+# Unauthenticated
+curl -s -m 5 -w "\nHTTP %{http_code}\n" "http://127.0.0.1:8000/auth/me"
+
+# Register test user
+TS=$(date +%Y%m%d_%H%M%S)
+EMAIL="deploytest${TS}@example.com"
+curl -s -c /tmp/ts360.txt -X POST "http://127.0.0.1:8000/auth/register" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\":\"Deploy Test\",\"email\":\"$EMAIL\",\"password\":\"TestPassword123!\",\"plan\":\"starter\"}"
+curl -s -b /tmp/ts360.txt "http://127.0.0.1:8000/auth/me"
+```
+
+Expected: first call `401`; register `{"ok":true,...}`; `/auth/me` returns email + plan.
+
+## 6. Sync to GitHub
+
+After a successful deploy, commit the same `app/main.py` to `natashaverela-speckm/taxstat360-api` on `main` (or PR).
+
+## Rollback
+
+```bash
+sudo cp /home/ubuntu/backups/taxstat360_YYYYMMDD_HHMMSS_main.py /home/ubuntu/risk-planner-BE/app/main.py
+sudo systemctl restart taxstat360.service
+```
+
+## Notes
+
+- `ensure_pw.sh` resets `admin@taxstat360.com` in **users.json** only; auth reads **DynamoDB**. Update admin password in DynamoDB separately if needed.
+- Frontend (Amplify) auto-deploys from `taxstat360` repo; backend does not.
+- Do not commit `.env` or `users.json` to git.
