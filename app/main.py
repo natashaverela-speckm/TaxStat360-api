@@ -1,6 +1,10 @@
-import json, os, hashlib, secrets, stripe, requests, boto3, time, hmac, bcrypt
+import json, os, hashlib, secrets, stripe, requests, boto3, time, hmac, bcrypt, base64, io
 from decimal import Decimal
 from urllib.parse import quote
+
+import pyotp
+import qrcode
+from cryptography.fernet import Fernet
 
 from boto3.dynamodb.conditions import Key
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -251,6 +255,75 @@ def _ddb_query_records(user_id):
     return items
 
 
+# --- M3 MFA (TOTP + encrypted backup codes) ---
+MFA_ISSUER = "TaxStat360"
+MFA_LOGIN_TTL = 300
+MFA_BACKUP_COUNT = 10
+
+
+def _mfa_fernet():
+    key = base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest())
+    return Fernet(key)
+
+
+def _mfa_encrypt(plain):
+    return _mfa_fernet().encrypt(plain.encode()).decode()
+
+
+def _mfa_decrypt(enc):
+    return _mfa_fernet().decrypt(enc.encode()).decode()
+
+
+def _mfa_qr_data_url(otpauth_uri):
+    buf = io.BytesIO()
+    qrcode.make(otpauth_uri).save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _mfa_new_backup_codes():
+    codes = []
+    hashes = []
+    for _ in range(MFA_BACKUP_COUNT):
+        raw = secrets.token_hex(4).upper()
+        code = f"{raw[:4]}-{raw[4:]}"
+        codes.append(code)
+        hashes.append(_hash_password(raw))
+    return codes, hashes
+
+
+def _mfa_verify_totp(secret, code):
+    code = (code or "").strip()
+    if not code.isdigit() or len(code) != 6:
+        return False
+    return pyotp.TOTP(secret).verify(code, valid_window=1)
+
+
+def _mfa_normalize_backup(code):
+    return (code or "").replace("-", "").replace(" ", "").upper()
+
+
+def _mfa_verify_backup(hashes, code):
+    norm = _mfa_normalize_backup(code)
+    if len(norm) != 8:
+        return None
+    for i, stored in enumerate(hashes or []):
+        if _verify_password(norm, stored):
+            return i
+    return None
+
+
+def _complete_login(email, x):
+    new_tok = secrets.token_hex(32)
+    x["tok"] = new_tok
+    x.pop("mfa_login_token", None)
+    x.pop("mfa_login_exp", None)
+    ddb_put_user(email, x)
+    plan = x.get("plan", "starter")
+    resp = JSONResponse({"ok": True, "plan": plan, "email": email})
+    _set_session_cookie(resp, email)
+    return resp
+
+
 def mc_subscribe(email, name=""):
     try:
         fname = name.split(" ")[0] if name else ""
@@ -341,6 +414,16 @@ class ResetReq(BaseModel):
     new_password: str
 
 
+class MfaCodeReq(BaseModel):
+    code: str
+
+
+class MfaChallengeReq(BaseModel):
+    email: str
+    login_token: str
+    code: str
+
+
 @app.post("/auth/register")
 @limiter.limit("3/minute")
 def register(r: Reg, request: Request):
@@ -396,13 +479,99 @@ def login(r: Log, request: Request):
     if not x or not _verify_password(r.password, x.get("pw", "")):
         raise HTTPException(401, "Invalid email or password")
     x["pw"] = _upgrade_password_hash(r.password, x.get("pw", ""))
-    new_tok = secrets.token_hex(32)
-    x["tok"] = new_tok
+    if x.get("mfa_enabled"):
+        login_token = secrets.token_hex(32)
+        x["mfa_login_token"] = login_token
+        x["mfa_login_exp"] = int(time.time()) + MFA_LOGIN_TTL
+        new_tok = secrets.token_hex(32)
+        x["tok"] = new_tok
+        ddb_put_user(email, x)
+        return JSONResponse(
+            {"mfa_required": True, "login_token": login_token, "email": email}
+        )
+    return _complete_login(email, x)
+
+
+@app.get("/auth/mfa/status")
+def mfa_status(request: Request):
+    email = _require_session_user(request)
+    x = ddb_get_user(email)
+    return {"enabled": bool(x and x.get("mfa_enabled"))}
+
+
+@app.post("/auth/mfa/setup")
+def mfa_setup(request: Request):
+    email = _require_session_user(request)
+    x = ddb_get_user(email)
+    if not x:
+        raise HTTPException(401, "Not authenticated")
+    if x.get("mfa_enabled"):
+        raise HTTPException(400, "MFA is already enabled")
+    secret = pyotp.random_base32()
+    x["mfa_pending_secret_enc"] = _mfa_encrypt(secret)
     ddb_put_user(email, x)
-    plan = x.get("plan", "starter")
-    resp = JSONResponse({"ok": True, "plan": plan, "email": email})
-    _set_session_cookie(resp, email)
-    return resp
+    otpauth = pyotp.TOTP(secret).provisioning_uri(name=email, issuer_name=MFA_ISSUER)
+    return {"qr_code_url": _mfa_qr_data_url(otpauth), "secret": secret}
+
+
+@app.post("/auth/mfa/verify")
+def mfa_verify(r: MfaCodeReq, request: Request):
+    email = _require_session_user(request)
+    x = ddb_get_user(email)
+    if not x or not x.get("mfa_pending_secret_enc"):
+        raise HTTPException(400, "MFA setup not started")
+    secret = _mfa_decrypt(x["mfa_pending_secret_enc"])
+    if not _mfa_verify_totp(secret, r.code):
+        raise HTTPException(401, "Invalid code — check your authenticator app and try again")
+    codes, hashes = _mfa_new_backup_codes()
+    x["mfa_enabled"] = True
+    x["mfa_secret_enc"] = x["mfa_pending_secret_enc"]
+    x.pop("mfa_pending_secret_enc", None)
+    x["mfa_backup_hashes"] = hashes
+    ddb_put_user(email, x)
+    return {"ok": True, "backup_codes": codes}
+
+
+@app.post("/auth/mfa/disable")
+def mfa_disable(r: MfaCodeReq, request: Request):
+    email = _require_session_user(request)
+    x = ddb_get_user(email)
+    if not x or not x.get("mfa_enabled"):
+        raise HTTPException(400, "MFA is not enabled")
+    secret = _mfa_decrypt(x["mfa_secret_enc"])
+    if not _mfa_verify_totp(secret, r.code):
+        raise HTTPException(401, "Invalid authentication code")
+    x["mfa_enabled"] = False
+    x.pop("mfa_secret_enc", None)
+    x.pop("mfa_backup_hashes", None)
+    x.pop("mfa_pending_secret_enc", None)
+    ddb_put_user(email, x)
+    return {"ok": True}
+
+
+@app.post("/auth/mfa/challenge")
+@limiter.limit("10/minute")
+def mfa_challenge(r: MfaChallengeReq, request: Request):
+    email = _norm_email(r.email)
+    x = ddb_get_user(email)
+    if not x or not x.get("mfa_enabled"):
+        raise HTTPException(401, "Invalid or expired login")
+    if not x.get("mfa_login_token") or not secrets.compare_digest(
+        x.get("mfa_login_token", ""), r.login_token
+    ):
+        raise HTTPException(401, "Invalid or expired login")
+    if int(time.time()) > int(x.get("mfa_login_exp", 0)):
+        raise HTTPException(401, "Login expired — please sign in again")
+    secret = _mfa_decrypt(x["mfa_secret_enc"])
+    code = (r.code or "").strip()
+    if not _mfa_verify_totp(secret, code):
+        idx = _mfa_verify_backup(x.get("mfa_backup_hashes") or [], code)
+        if idx is None:
+            raise HTTPException(401, "Invalid authentication code")
+        hashes = list(x.get("mfa_backup_hashes") or [])
+        hashes.pop(idx)
+        x["mfa_backup_hashes"] = hashes
+    return _complete_login(email, x)
 
 
 @app.get("/auth/me")

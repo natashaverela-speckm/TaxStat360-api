@@ -92,6 +92,52 @@ curl -s -b /tmp/ts360.txt "http://127.0.0.1:8000/records"
 
 Expected: PUT returns the record with `updatedAt`; GET returns a one-item array.
 
+## Milestone 3 — 2FA (TOTP)
+
+### Install Python deps (once per server)
+
+```bash
+sudo -u ubuntu /home/ubuntu/risk-planner-BE/venv/bin/pip install pyotp 'qrcode[pil]' cryptography
+```
+
+Deploy `app/main.py` from `taxstat360-api` `main` (includes `/auth/mfa/*` and login MFA challenge).
+
+### M3 smoke test (Session Manager)
+
+```bash
+# 1) Register + session
+TS=$(date +%Y%m%d_%H%M%S)
+EMAIL="mfatest${TS}@example.com"
+PASS="TestPassword123!"
+curl -s -c /tmp/mfa.txt -X POST "http://127.0.0.1:8000/auth/register" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\":\"MFA Test\",\"email\":\"$EMAIL\",\"password\":\"$PASS\",\"plan\":\"starter\"}"
+
+# 2) MFA status (should be disabled)
+curl -s -b /tmp/mfa.txt "http://127.0.0.1:8000/auth/mfa/status"
+
+# 3) Start setup — copy "secret" from JSON, add to Google Authenticator
+curl -s -b /tmp/mfa.txt -X POST "http://127.0.0.1:8000/auth/mfa/setup"
+
+# 4) Verify with 6-digit TOTP code from app (replace CODE)
+curl -s -b /tmp/mfa.txt -X POST "http://127.0.0.1:8000/auth/mfa/verify" \
+  -H "Content-Type: application/json" \
+  -d '{"code":"123456"}'
+
+# 5) Login requires MFA — no session cookie until challenge
+curl -s -c /tmp/mfa2.txt -X POST "http://127.0.0.1:8000/auth/login" \
+  -H "Content-Type: application/json" \
+  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}"
+# Expect: {"mfa_required":true,"login_token":"...","email":"..."}
+
+# 6) Complete challenge (replace LOGIN_TOKEN and CODE)
+curl -s -c /tmp/mfa2.txt -X POST "http://127.0.0.1:8000/auth/mfa/challenge" \
+  -H "Content-Type: application/json" \
+  -d "{\"email\":\"$EMAIL\",\"login_token\":\"LOGIN_TOKEN\",\"code\":\"123456\"}"
+```
+
+Frontend: Settings → Enable 2FA (QR scan) → log out → log in → enter TOTP code.
+
 ## 6. Sync to GitHub
 
 After a successful deploy, commit the same `app/main.py` to `natashaverela-speckm/taxstat360-api` on `main` (or PR).
