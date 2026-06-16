@@ -835,28 +835,42 @@ def subscribe(r: Sub, user=Depends(get_user_from_token)):
 
 
 OAUTH = {
+    # Production app credentials (must match QUICKBOOKS_CLIENT_SECRET etc. in .env).
+    # Prior git client_ids were a different OAuth app registration — token exchange failed.
     "quickbooks": {
-        "client_id": "ABw0WBOceb971XVhquWW9DWJfOHZkF5KjOr8SthaNACDKOILpZ",
+        "client_id": os.environ.get(
+            "QUICKBOOKS_CLIENT_ID",
+            "AB1FhVS3wJV2oOLUXNS8ZlnCHuUFW3XTM20rOydbCln0Pj1vZG",
+        ),
         "redirect": "https://app.taxstat360.com/integrations/quickbooks/callback",
-        "auth_url": "https://appcenter.intuit.com/connect/oauth2",
+        "auth_url": "https://appcenter.intuit.com/app/connect/oauth2",
         "scope": "com.intuit.quickbooks.accounting",
     },
     "freshbooks": {
-        "client_id": "86619f0b77a5405cc791956760108aa8da609558bc4945e596c82adcdcd270c2",
+        "client_id": os.environ.get(
+            "FRESHBOOKS_CLIENT_ID",
+            "47b688958adf0a8250c4e799d5a258509e5e4f7bdbb7b0940ba2893ce13b7f03",
+        ),
         "redirect": "https://app.taxstat360.com/integrations/freshbooks/callback",
         "auth_url": "https://auth.freshbooks.com/oauth/authorize",
-        "scope": "user:profile:read",
+        "scope": "user:profile:read user:reports:read",
     },
     "xero": {
-        "client_id": "0921E54B89164E24BA072A0E79741FA5",
+        "client_id": os.environ.get(
+            "XERO_CLIENT_ID",
+            "B264F13CC72F458AA766E9627ABA95E2",
+        ),
         "redirect": "https://app.taxstat360.com/integrations/xero/callback",
         "auth_url": "https://login.xero.com/identity/connect/authorize",
-        "scope": "openid profile email offline_access accounting.reports.read",
+        "scope": "openid profile email offline_access accounting.reports.profitandloss.read",
     },
     "wave": {
-        "client_id": "IS3R7n6dQG7IKscrPQSn4afGSJskrnToqpYik7Fp",
+        "client_id": os.environ.get(
+            "WAVE_CLIENT_ID",
+            "tV2wa6N3ltIhHVu1S4lgz_CP48xm8loeF4zczbTY",
+        ),
         "redirect": "https://app.taxstat360.com/integrations/wave/callback",
-        "auth_url": "https://api.waveapps.com/oauth2/authorize",
+        "auth_url": "https://api.waveapps.com/oauth2/authorize/",
         "scope": "account:* business:read",
     },
 }
