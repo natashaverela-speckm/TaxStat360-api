@@ -267,6 +267,7 @@ def _user_public(rec, email):
         "plan": rec.get("plan", "starter"),
         "name": rec.get("name", ""),
         "verified": rec.get("verified", False),
+        "is_admin": _is_admin(email),
     }
 
 
@@ -279,6 +280,13 @@ def _require_session_user(request):
     email = _session_email(request)
     if not email:
         raise HTTPException(401, "Not authenticated")
+    # A session cookie is a stateless signed token valid for SESSION_MAX_AGE, so a
+    # deleted account would otherwise keep access until expiry. Verifying the user
+    # still exists is what makes account deletion actually invalidate the session
+    # (notably for the admin-deletes-someone-else case). Costs one get_item per
+    # authenticated request.
+    if not ddb_user_exists(email):
+        raise HTTPException(401, "Account no longer exists")
     return email
 
 
@@ -301,6 +309,188 @@ def _ddb_query_records(user_id):
             break
         kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
     return items
+
+
+# --- M4 ACCOUNT DELETION (admin gate + Stripe teardown + audit log) ---
+# Implements the self-service / admin "delete account" flow.
+#
+# DynamoDB has no SQL-style "begin / commit / rollback" transaction that can span
+# an external Stripe call, so we get the same guarantee the request asked for a
+# different way: do the Stripe teardown FIRST (the step most likely to fail). If
+# Stripe errors hard, we raise before touching DynamoDB, so the account is left
+# fully intact (never half-deleted). Only once Stripe has succeeded (or is already
+# gone) do we delete the DB rows, which are idempotent and safe to retry. An audit
+# row is written before AND after so a failure is never silent.
+
+# Admins are configured by env (comma-separated). Defaults to the support admin.
+ADMIN_EMAILS = {
+    _norm_email(e)
+    for e in os.environ.get("ADMIN_EMAILS", "admin@taxstat360.com").split(",")
+    if e.strip()
+}
+
+
+def _is_admin(email):
+    return _norm_email(email) in ADMIN_EMAILS
+
+
+# Audit log lives in its own table so deletion leaves proof (who / which user / when)
+# even though all of the user's PII is erased. It deliberately stores no tax data.
+AUDIT_TABLE = os.environ.get("AUDIT_TABLE", "taxstat360-audit")
+_audit_tbl = _ddb.Table(AUDIT_TABLE)
+
+
+def _ensure_audit_table():
+    """Best-effort create-if-missing for the audit table. No-op if it already
+    exists; if the IAM role can't create tables, this logs and the operator can
+    run scripts/create-audit-table.sh once. Deletion never blocks on this."""
+    try:
+        _audit_tbl.load()
+        return
+    except Exception:
+        pass
+    try:
+        _ddb.create_table(
+            TableName=AUDIT_TABLE,
+            KeySchema=[{"AttributeName": "auditId", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "auditId", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        _audit_tbl.wait_until_exists()
+    except Exception as e:
+        print(f"AUDIT table auto-create skipped: {e}", flush=True)
+
+
+def _write_audit(action, actor_email, target_email, status, detail=None):
+    item = {
+        "auditId": secrets.token_hex(16),
+        "ts": int(time.time()),
+        "action": action,
+        "actor": _norm_email(actor_email),
+        "target": _norm_email(target_email),
+        "status": status,  # "started" | "completed" | "failed"
+    }
+    if detail is not None:
+        item["detail"] = str(detail)[:1000]
+    try:
+        _audit_tbl.put_item(Item=_to_ddb(item))
+        return {"ok": True, "auditId": item["auditId"]}
+    except Exception as e:
+        # Loud, not silent: surfaced in logs and in the API response's audit flag.
+        print(f"AUDIT write failed ({status}) target={target_email}: {e}", flush=True)
+        return {"ok": False, "error": str(e)}
+
+
+def _stripe_is_missing(e):
+    """True when a Stripe error means the resource is already gone (idempotent)."""
+    code = getattr(e, "code", "") or ""
+    msg = str(getattr(e, "user_message", "") or e)
+    return code == "resource_missing" or "no such" in msg.lower()
+
+
+def _stripe_teardown(stripe_customer_id):
+    """Cancel any non-terminal subscriptions, then delete the customer.
+    Idempotent: an already-gone customer/subscription is treated as success.
+    A genuine Stripe error (network/auth/etc.) is re-raised so the caller aborts
+    BEFORE any DB deletion."""
+    result = {
+        "customer_id": stripe_customer_id or "",
+        "subscriptions_canceled": 0,
+        "customer_deleted": False,
+        "already_absent": False,
+    }
+    if not stripe_customer_id:
+        result["already_absent"] = True
+        return result
+    try:
+        subs = stripe.Subscription.list(customer=stripe_customer_id, status="all", limit=100)
+        for s in subs.auto_paging_iter():
+            if s.get("status") in ("canceled", "incomplete_expired"):
+                continue
+            try:
+                stripe.Subscription.cancel(s.get("id"))
+                result["subscriptions_canceled"] += 1
+            except Exception as e:
+                if not _stripe_is_missing(e):
+                    raise
+    except Exception as e:
+        if _stripe_is_missing(e):
+            result["already_absent"] = True
+            return result
+        raise
+    try:
+        stripe.Customer.delete(stripe_customer_id)
+        result["customer_deleted"] = True
+    except Exception as e:
+        if _stripe_is_missing(e):
+            result["already_absent"] = True
+        else:
+            raise
+    return result
+
+
+def _delete_all_user_records(user_id):
+    """Erase every saved tax record for a user. Idempotent (no rows -> 0)."""
+    user_id = _norm_email(user_id)
+    items = _ddb_query_records(user_id)
+    count = 0
+    with _records_tbl.batch_writer() as bw:
+        for it in items:
+            rid = it.get("recordId")
+            if rid is None:
+                continue
+            bw.delete_item(Key={"userId": user_id, "recordId": rid})
+            count += 1
+    return count
+
+
+def _delete_user_record(email):
+    """Delete the user row. delete_item on an absent key is a no-op (idempotent)."""
+    _users_tbl.delete_item(Key={"email": _norm_email(email)})
+
+
+def _perform_account_deletion(target_email, actor_email):
+    """Single source of truth for both the self-delete and admin-delete endpoints.
+    Order: Stripe -> records -> user -> audit. Re-runnable; never half-commits the
+    DB on a Stripe failure."""
+    target_email = _norm_email(target_email)
+    actor_email = _norm_email(actor_email)
+    if not target_email:
+        raise HTTPException(400, "Target email required")
+    _ensure_audit_table()
+    user = ddb_get_user(target_email)  # may be None on an idempotent re-run
+    _write_audit("account.delete", actor_email, target_email, "started")
+    try:
+        stripe_cid = (user or {}).get("stripe_customer_id", "")
+        # 1 + 2. Stripe first: a hard failure here aborts before any DB delete.
+        stripe_result = _stripe_teardown(stripe_cid)
+        # 3. DB: records first, user row last, so a retry after a partial failure
+        #    is always clean (the user row stays the anchor until everything else is gone).
+        records_deleted = _delete_all_user_records(target_email)
+        _delete_user_record(target_email)
+        # 4. Audit: proof of who / which user / when.
+        completed = _write_audit(
+            "account.delete",
+            actor_email,
+            target_email,
+            "completed",
+            detail=f"stripe={stripe_result} records_deleted={records_deleted} existed={user is not None}",
+        )
+        return {
+            "ok": True,
+            "deleted": target_email,
+            "already_absent": user is None,
+            "records_deleted": records_deleted,
+            "stripe": stripe_result,
+            "audit_logged": bool(completed.get("ok")),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Stripe (or an unexpected DB) failure: record it and surface a clear error.
+        # On a Stripe failure no DB rows were touched, so the account is intact.
+        _write_audit("account.delete", actor_email, target_email, "failed", detail=str(e))
+        raise HTTPException(502, f"Account deletion failed before completion: {e}")
 
 
 # --- M3 MFA (TOTP + encrypted backup codes) ---
@@ -743,7 +933,12 @@ def auth_logout():
 
 @app.get("/user/me")
 def me(user=Depends(get_user_from_token)):
-    return {"email": user["email"], "plan": user.get("plan", "starter"), "name": user.get("name", "")}
+    return {
+        "email": user["email"],
+        "plan": user.get("plan", "starter"),
+        "name": user.get("name", ""),
+        "is_admin": _is_admin(user["email"]),
+    }
 
 
 @app.post("/user/business-info")
@@ -792,6 +987,38 @@ def delete_record(record_id: int, request: Request):
         raise HTTPException(404, "Record not found")
     _records_tbl.delete_item(Key={"userId": user_id, "recordId": record_id})
     return {"ok": True}
+
+
+@app.delete("/account")
+def delete_own_account(request: Request):
+    """Account owner permanently deletes their own account."""
+    email = _require_session_user(request)
+    result = _perform_account_deletion(email, actor_email=email)
+    resp = JSONResponse(result)
+    _clear_session_cookie(resp)  # invalidate this session immediately
+    return resp
+
+
+@app.delete("/admin/users/{target_email}")
+def admin_delete_user(target_email: str, request: Request):
+    """Admin permanently deletes a specified user (e.g. for a request that arrived
+    by email). Everyone who is not an admin is rejected with 403."""
+    actor = _require_session_user(request)
+    if not _is_admin(actor):
+        raise HTTPException(403, "Admin access required")
+    target = _norm_email(unquote(target_email))
+    if not target:
+        raise HTTPException(400, "Target email required")
+    if target == _norm_email(actor):
+        # Guard: don't let an admin wipe their own account by accident from the
+        # admin tool. Self-deletion must go through Settings deliberately.
+        raise HTTPException(
+            400,
+            "Admins can't delete their own account from the admin tool. "
+            "Use Settings -> Delete account to remove your own account.",
+        )
+    result = _perform_account_deletion(target, actor_email=actor)
+    return JSONResponse(result)
 
 
 @app.post("/stripe/setup-intent")
