@@ -1008,11 +1008,11 @@ def _parse_xero_pnl(report):
 
 
 def _parse_qb_pnl(data):
-    rev = cogs = opex = 0.0
+    rev = cogs = opex = other_income = 0.0
     net = None
 
     def walk(rows):
-        nonlocal rev, cogs, opex, net
+        nonlocal rev, cogs, opex, other_income, net
         for row in rows or []:
             if not isinstance(row, dict):
                 continue
@@ -1025,13 +1025,18 @@ def _parse_qb_pnl(data):
                     net = amt
                 elif grp == "income" or (
                     "total income" in name and "other" not in name
-                ):
+                ) or "total for income" in name:
                     rev = amt
+                elif grp in ("otherincome", "other income") or (
+                    "total for other income" in name
+                    or ("other income" in name and "total" in name)
+                ):
+                    other_income = amt
                 elif grp in ("cogs", "costofgoodssold") or "cost of goods" in name:
                     cogs = abs(amt)
                 elif grp == "expenses" or (
                     "total expenses" in name and "other" not in name
-                ):
+                ) or "total for expenses" in name:
                     opex = abs(amt)
             nested = row.get("Rows", {}).get("Row", [])
             if nested:
@@ -1039,6 +1044,7 @@ def _parse_qb_pnl(data):
 
     top = data.get("Rows", {}).get("Row", [])
     walk(top if isinstance(top, list) else ([top] if top else []))
+    rev += other_income
     exp = cogs + opex
     if net is None and (rev or exp):
         net = rev - exp
@@ -1276,7 +1282,11 @@ def integration_data(
                 return {"error": "missing realm"}
             r = requests.get(
                 f"https://quickbooks.api.intuit.com/v3/company/{realm}/reports/ProfitAndLoss",
-                params={"start_date": start, "end_date": end},
+                params={
+                    "start_date": start,
+                    "end_date": end,
+                    "accounting_method": os.environ.get("QUICKBOOKS_ACCOUNTING_METHOD", "Cash"),
+                },
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
                 timeout=30,
             )
