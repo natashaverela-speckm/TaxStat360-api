@@ -322,6 +322,28 @@ def _mfa_decrypt(enc):
     return _mfa_fernet().decrypt(enc.encode()).decode()
 
 
+def _get_mfa_secret(x, email=None):
+    """Read TOTP secret from encrypted storage, with legacy plaintext fallback."""
+    enc = x.get("mfa_secret_enc")
+    if enc:
+        try:
+            return _mfa_decrypt(enc)
+        except Exception as e:
+            print(f"MFA decrypt failed for {email or '?'}: {e}", flush=True)
+    plain = x.get("mfa_secret")
+    if plain:
+        secret = str(plain)
+        try:
+            x["mfa_secret_enc"] = _mfa_encrypt(secret)
+            x.pop("mfa_secret", None)
+            if email:
+                ddb_put_user(email, x)
+        except Exception as e:
+            print(f"MFA legacy migrate failed for {email or '?'}: {e}", flush=True)
+        return secret
+    return None
+
+
 def _mfa_qr_data_url(otpauth_uri):
     buf = io.BytesIO()
     qrcode.make(otpauth_uri).save(buf, format="PNG")
@@ -598,7 +620,12 @@ def mfa_disable(r: MfaCodeReq, request: Request):
     x = ddb_get_user(email)
     if not x or not x.get("mfa_enabled"):
         raise HTTPException(400, "MFA is not enabled")
-    secret = _mfa_decrypt(x["mfa_secret_enc"])
+    secret = _get_mfa_secret(x, email)
+    if not secret:
+        raise HTTPException(
+            503,
+            "Two-factor authentication must be set up again. Contact support to reset MFA on your account.",
+        )
     if not _mfa_verify_totp(secret, r.code):
         raise HTTPException(401, "Invalid authentication code")
     x["mfa_enabled"] = False
@@ -622,7 +649,12 @@ def mfa_challenge(r: MfaChallengeReq, request: Request):
         raise HTTPException(401, "Invalid or expired login")
     if int(time.time()) > int(x.get("mfa_login_exp", 0)):
         raise HTTPException(401, "Login expired — please sign in again")
-    secret = _mfa_decrypt(x["mfa_secret_enc"])
+    secret = _get_mfa_secret(x, email)
+    if not secret:
+        raise HTTPException(
+            503,
+            "Two-factor authentication must be set up again. Contact support to reset MFA on your account.",
+        )
     code = (r.code or "").strip()
     if not _mfa_verify_totp(secret, code):
         idx = _mfa_verify_backup(x.get("mfa_backup_hashes") or [], code)
