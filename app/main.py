@@ -852,8 +852,12 @@ OAUTH = {
             "47b688958adf0a8250c4e799d5a258509e5e4f7bdbb7b0940ba2893ce13b7f03",
         ),
         "redirect": "https://app.taxstat360.com/integrations/freshbooks/callback",
-        "auth_url": "https://auth.freshbooks.com/oauth/authorize",
-        "scope": "user:profile:read user:reports:read",
+        "auth_url": "https://auth.freshbooks.com/oauth/authorize/",
+        # user:reports:read required for P&L — must be enabled on the app in FreshBooks Developer.
+        "scope": os.environ.get(
+            "FRESHBOOKS_SCOPE",
+            "user:profile:read user:reports:read",
+        ),
     },
     "xero": {
         "client_id": os.environ.get(
@@ -904,9 +908,141 @@ def _oauth_secret(provider):
     return os.environ.get(env_key, "") if env_key else ""
 
 
+def _parse_pl_amount(val):
+    try:
+        s = str(val or "0").replace(",", "").replace("$", "").strip()
+        if s.startswith("(") and s.endswith(")"):
+            s = "-" + s[1:-1]
+        return float(s or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pnl_date_range(year=None):
+    """Calendar-year P&L window for the selected tax year (full prior years, YTD for current)."""
+    today = date.today()
+    try:
+        y = int(year) if year not in (None, "") else today.year
+    except (TypeError, ValueError):
+        y = today.year
+    start = f"{y}-01-01"
+    if y < today.year:
+        end = f"{y}-12-31"
+    elif y > today.year:
+        end = start
+    else:
+        end = today.isoformat()
+    return start, end
+
+
 def _ytd_range():
-    y = date.today().year
-    return f"{y}-01-01", date.today().isoformat()
+    return _pnl_date_range()
+
+
+def _xero_refresh_access_token(refresh_token):
+    if not refresh_token:
+        return None
+    o = OAUTH["xero"]
+    secret = _oauth_secret("xero")
+    if not secret:
+        return None
+    creds = base64.b64encode(f"{o['client_id']}:{secret}".encode()).decode()
+    r = requests.post(
+        TOKEN_URLS["xero"],
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        headers={
+            "Authorization": f"Basic {creds}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        timeout=30,
+    )
+    if not r.ok:
+        print(f"xero token refresh: {r.status_code} {r.text[:200]}", flush=True)
+        return None
+    return r.json().get("access_token")
+
+
+def _xero_collect_summary_rows(rows, found=None):
+    if found is None:
+        found = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        nested = row.get("Rows")
+        if nested:
+            _xero_collect_summary_rows(nested, found)
+        rt = row.get("RowType", "")
+        cells = row.get("Cells", [])
+        if len(cells) < 2:
+            continue
+        label = str(cells[0].get("Value", "")).strip().lower()
+        amt = _parse_pl_amount(cells[1].get("Value"))
+        if rt == "SummaryRow":
+            found[label] = amt
+        elif rt == "Row" and "net profit" in label:
+            found[label] = amt
+    return found
+
+
+def _parse_xero_pnl(report):
+    summaries = _xero_collect_summary_rows(report.get("Rows", []))
+    rev = cogs = opex = 0.0
+    net = None
+    for label, amt in summaries.items():
+        if "total income" in label:
+            rev = amt
+        elif (
+            "total cost of sales" in label
+            or "total cogs" in label
+            or "cost of goods" in label
+        ):
+            cogs += abs(amt)
+        elif "total operating expenses" in label or label == "total expenses":
+            opex = abs(amt)
+        elif "net profit" in label:
+            net = amt
+    exp = cogs + opex
+    if net is None and (rev or exp):
+        net = rev - exp
+    return rev, exp, net
+
+
+def _parse_qb_pnl(data):
+    rev = cogs = opex = 0.0
+    net = None
+
+    def walk(rows):
+        nonlocal rev, cogs, opex, net
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            grp = (row.get("group") or "").lower()
+            summary = row.get("Summary", {}).get("ColData", [])
+            if len(summary) >= 2:
+                name = str(summary[0].get("value", "")).lower()
+                amt = _parse_pl_amount(summary[1].get("value"))
+                if "net income" in name or "net profit" in name:
+                    net = amt
+                elif grp == "income" or (
+                    "total income" in name and "other" not in name
+                ):
+                    rev = amt
+                elif grp in ("cogs", "costofgoodssold") or "cost of goods" in name:
+                    cogs = abs(amt)
+                elif grp == "expenses" or (
+                    "total expenses" in name and "other" not in name
+                ):
+                    opex = abs(amt)
+            nested = row.get("Rows", {}).get("Row", [])
+            if nested:
+                walk(nested if isinstance(nested, list) else [nested])
+
+    top = data.get("Rows", {}).get("Row", [])
+    walk(top if isinstance(top, list) else ([top] if top else []))
+    exp = cogs + opex
+    if net is None and (rev or exp):
+        net = rev - exp
+    return rev, exp, net
 
 
 def _pnl_result(revenue, expenses, officer_salary=0, net_profit=None):
@@ -935,6 +1071,66 @@ def _fb_pl_amount(pl, *keys):
     return 0.0
 
 
+def _freshbooks_token_exchange(o, secret, code):
+    """FreshBooks token endpoint — try JSON, form, and Basic auth (API docs vary)."""
+    token_url = TOKEN_URLS["freshbooks"]
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": o["client_id"],
+        "client_secret": secret,
+        "code": code,
+        "redirect_uri": o["redirect"],
+    }
+    creds = base64.b64encode(f"{o['client_id']}:{secret}".encode()).decode()
+    attempts = [
+        (
+            "json",
+            lambda: requests.post(
+                token_url,
+                json=payload,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                timeout=30,
+            ),
+        ),
+        (
+            "form",
+            lambda: requests.post(
+                token_url,
+                data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30,
+            ),
+        ),
+        (
+            "basic_form",
+            lambda: requests.post(
+                token_url,
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": o["redirect"],
+                },
+                headers={
+                    "Authorization": f"Basic {creds}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                timeout=30,
+            ),
+        ),
+    ]
+    last = None
+    for name, req in attempts:
+        r = req()
+        last = r
+        if r.ok:
+            print(f"freshbooks token exchange ok via {name}", flush=True)
+            return r.json()
+        print(f"freshbooks token exchange {name}: {r.status_code} {r.text[:200]}", flush=True)
+    if last is not None:
+        print(f"oauth token exchange freshbooks: {last.status_code} {last.text[:300]}", flush=True)
+    raise HTTPException(400, "OAuth token exchange failed")
+
+
 def _exchange_oauth_code(provider, code):
     o = OAUTH[provider]
     secret = _oauth_secret(provider)
@@ -959,18 +1155,7 @@ def _exchange_oauth_code(provider, code):
             timeout=30,
         )
     elif provider == "freshbooks":
-        # Match bak_working: JSON body (form-urlencoded caused invalid_client).
-        r = requests.post(
-            TOKEN_URLS[provider],
-            json={
-                "grant_type": "authorization_code",
-                "client_id": o["client_id"],
-                "client_secret": secret,
-                "code": code,
-                "redirect_uri": o["redirect"],
-            },
-            timeout=30,
-        )
+        return _freshbooks_token_exchange(o, secret, code)
     else:
         r = requests.post(
             TOKEN_URLS[provider],
@@ -1071,12 +1256,20 @@ def callback(p: str, code: str = "", state: str = "", realmId: str = "", tenantI
 
 
 @app.get("/integrations/{p}/data")
-def integration_data(p: str, token: str = "", realm: str = "", tenant: str = "", account: str = ""):
+def integration_data(
+    p: str,
+    token: str = "",
+    realm: str = "",
+    tenant: str = "",
+    account: str = "",
+    year: str = "",
+    refresh_token: str = "",
+):
     if p not in ALLOWED_PROVIDERS:
         raise HTTPException(404)
     if not token:
         return {"error": "missing token"}
-    start, end = _ytd_range()
+    start, end = _pnl_date_range(year)
     try:
         if p == "quickbooks":
             if not realm:
@@ -1087,55 +1280,37 @@ def integration_data(p: str, token: str = "", realm: str = "", tenant: str = "",
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
                 timeout=30,
             )
-            rev = exp = 0.0
-            if r.ok:
-                for row in r.json().get("Rows", {}).get("Row", []) or []:
-                    grp = row.get("group", "") or ""
-                    if not grp and row.get("Header"):
-                        grp = row["Header"].get("ColData", [{}])[0].get("value", "")
-                    summary = row.get("Summary", {}).get("ColData", [])
-                    if len(summary) < 2:
-                        continue
-                    try:
-                        amt = float(str(summary[1].get("value", "0")).replace(",", "") or 0)
-                    except ValueError:
-                        amt = 0.0
-                    gl = str(grp).lower()
-                    if "income" in gl or "revenue" in gl:
-                        rev += amt
-                    elif "expense" in gl:
-                        exp += amt
-            return _pnl_result(rev, exp)
+            if not r.ok:
+                print(f"quickbooks profitloss: {r.status_code} {r.text[:300]}", flush=True)
+                return {"error": "quickbooks report failed"}
+            rev, exp, net = _parse_qb_pnl(r.json())
+            return _pnl_result(rev, exp, net_profit=net)
         if p == "xero":
             if not tenant:
                 return {"error": "missing tenant"}
+            access = token
+            if refresh_token:
+                refreshed = _xero_refresh_access_token(refresh_token)
+                if refreshed:
+                    access = refreshed
             r = requests.get(
                 "https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss",
                 params={"fromDate": start, "toDate": end},
                 headers={
-                    "Authorization": f"Bearer {token}",
+                    "Authorization": f"Bearer {access}",
                     "Xero-tenant-id": tenant,
                     "Accept": "application/json",
                 },
                 timeout=30,
             )
-            rev = exp = 0.0
-            if r.ok:
-                for row in r.json().get("Reports", [{}])[0].get("Rows", []) or []:
-                    title = str(row.get("RowType", "")).lower()
-                    cells = row.get("Cells", [])
-                    if len(cells) < 2:
-                        continue
-                    try:
-                        amt = float(str(cells[1].get("Value", "0")).replace(",", "") or 0)
-                    except ValueError:
-                        amt = 0.0
-                    label = str(cells[0].get("Value", "")).lower()
-                    if title == "section" and ("income" in label or "revenue" in label):
-                        rev += amt
-                    elif title == "section" and "expense" in label:
-                        exp += amt
-            return _pnl_result(rev, exp)
+            if not r.ok:
+                print(f"xero profitloss: {r.status_code} {r.text[:300]}", flush=True)
+                return {"error": "xero report failed"}
+            reports = r.json().get("Reports") or []
+            if not reports:
+                return {"error": "xero report empty"}
+            rev, exp, net = _parse_xero_pnl(reports[0])
+            return _pnl_result(rev, exp, net_profit=net)
         if p == "wave":
             q1 = {"query": "{businesses(page:1,pageSize:1){edges{node{id}}}}"}
             br = requests.post(
