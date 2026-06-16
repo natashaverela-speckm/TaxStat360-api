@@ -965,25 +965,42 @@ def _xero_refresh_access_token(refresh_token):
     return r.json().get("access_token")
 
 
-def _xero_collect_summary_rows(rows, found=None):
+def _xero_row_amount(cells):
+    """First numeric column in a Xero report row (skip label column 0)."""
+    if not cells or len(cells) < 2:
+        return 0.0
+    for cell in cells[1:]:
+        val = cell.get("Value")
+        if val is not None and str(val).strip() not in ("", "-"):
+            return _parse_pl_amount(val)
+    return _parse_pl_amount(cells[1].get("Value"))
+
+
+def _xero_collect_summary_rows(rows, found=None, section=""):
     if found is None:
         found = {}
     for row in rows or []:
         if not isinstance(row, dict):
             continue
+        section_title = (row.get("Title") or section or "").strip().lower()
         nested = row.get("Rows")
         if nested:
-            _xero_collect_summary_rows(nested, found)
-        rt = row.get("RowType", "")
+            _xero_collect_summary_rows(nested, found, section_title)
+        rt = str(row.get("RowType", "")).lower()
         cells = row.get("Cells", [])
         if len(cells) < 2:
             continue
         label = str(cells[0].get("Value", "")).strip().lower()
-        amt = _parse_pl_amount(cells[1].get("Value"))
-        if rt == "SummaryRow":
+        amt = _xero_row_amount(cells)
+        if rt in ("summaryrow", "summary"):
             found[label] = amt
-        elif rt == "Row" and "net profit" in label:
+        elif rt == "row" and any(
+            k in label for k in ("net profit", "net income", "net loss", "net operating")
+        ):
             found[label] = amt
+        elif rt == "row" and section_title and amt:
+            # Detail line under a named section — keep for fallback totals.
+            found[f"{section_title}::{label}"] = amt
     return found
 
 
@@ -992,6 +1009,8 @@ def _parse_xero_pnl(report):
     rev = cogs = opex = 0.0
     net = None
     for label, amt in summaries.items():
+        if "::" in label:
+            continue
         if any(
             k in label
             for k in (
@@ -999,17 +1018,18 @@ def _parse_xero_pnl(report):
                 "total revenue",
                 "total trading income",
                 "total sales",
+                "gross profit",
             )
         ):
-            rev = amt
-        elif "gross profit" in label and not rev:
-            rev = amt
+            if "expense" not in label and "cost" not in label:
+                rev = max(rev, amt)
         elif any(
             k in label
             for k in (
                 "total cost of sales",
                 "total cogs",
                 "cost of goods",
+                "cost of sales",
             )
         ):
             cogs += abs(amt)
@@ -1020,17 +1040,35 @@ def _parse_xero_pnl(report):
                 "total operating costs",
                 "total expenses",
                 "total expense",
+                "operating expenses",
             )
         ) and "other income" not in label:
-            opex = abs(amt)
-        elif "net profit" in label or label == "net income":
+            opex = max(opex, abs(amt))
+        elif any(k in label for k in ("net profit", "net income", "net loss")):
             net = amt
     exp = cogs + opex
     if net is None and (rev or exp):
         net = rev - exp
+    # Fallback: section-scoped detail rows (some orgs omit SummaryRow totals).
+    if not rev and not exp and net is None:
+        sec_inc = sec_exp = 0.0
+        for label, amt in summaries.items():
+            if "::" not in label:
+                continue
+            sec, _ = label.split("::", 1)
+            if any(k in sec for k in ("income", "revenue", "sales")):
+                sec_inc += amt
+            elif any(k in sec for k in ("expense", "cost")):
+                sec_exp += abs(amt)
+        if sec_inc or sec_exp:
+            rev, exp = sec_inc, sec_exp
+            net = rev - exp
     if not rev and not exp and net is None and summaries:
-        print(f"xero pnl unmatched summaries: {list(summaries.keys())[:20]}", flush=True)
-    return rev, exp, net
+        print(
+            f"xero pnl unmatched summaries: {list(summaries.keys())[:25]}",
+            flush=True,
+        )
+    return rev, exp, net, summaries
 
 
 def _parse_qb_pnl(data):
@@ -1339,7 +1377,7 @@ def integration_data(
                     access = refreshed
             r = requests.get(
                 "https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss",
-                params={"fromDate": start, "toDate": end},
+                params={"fromDate": start, "toDate": end, "standardLayout": "true"},
                 headers={
                     "Authorization": f"Bearer {access}",
                     "Xero-tenant-id": tenant,
@@ -1353,8 +1391,18 @@ def integration_data(
             reports = r.json().get("Reports") or []
             if not reports:
                 return {"error": "xero report empty"}
-            rev, exp, net = _parse_xero_pnl(reports[0])
-            return _pnl_result(rev, exp, net_profit=net)
+            rev, exp, net, summaries = _parse_xero_pnl(reports[0])
+            out = _pnl_result(rev, exp, net_profit=net)
+            if (
+                not rev
+                and not exp
+                and (net is None or net == 0)
+                and summaries
+            ):
+                out["debug_labels"] = [
+                    k for k in summaries.keys() if "::" not in k
+                ][:20]
+            return out
         if p == "wave":
             q1 = {"query": "{businesses(page:1,pageSize:1){edges{node{id}}}}"}
             br = requests.post(
