@@ -99,6 +99,30 @@ def _upgrade_password_hash(password, stored):
     return _hash_password(password)
 
 
+def _resolve_stored_password(item):
+    """Prefer bcrypt over legacy SHA-256 when multiple password fields disagree."""
+    candidates = [
+        item.get("pw"),
+        item.get("password_hash"),
+        item.get("password"),
+    ]
+    for c in candidates:
+        if c and str(c).startswith("$2"):
+            return str(c)
+    for c in candidates:
+        if c:
+            return str(c)
+    return ""
+
+
+def _strip_legacy_user_fields(item):
+    """Remove fields written outside the app (legacy JSON / manual DDB edits)."""
+    item.pop("password", None)
+    item.pop("mfa_secret", None)
+    item.pop("mfa_backup_codes", None)
+    return item
+
+
 def ddb_get_user(email):
     email = _norm_email(email)
     if not email:
@@ -108,8 +132,8 @@ def ddb_get_user(email):
     if not item:
         return None
     item = _from_ddb(item)
-    pw = item.get("password_hash") or item.get("password") or item.get("pw")
-    if pw and "pw" not in item:
+    pw = _resolve_stored_password(item)
+    if pw:
         item["pw"] = pw
     return item
 
@@ -118,9 +142,13 @@ def ddb_put_user(email, rec):
     email = _norm_email(email)
     item = dict(rec)
     item["email"] = email
-    if "pw" in item:
+    pw = _resolve_stored_password(item)
+    if pw:
+        item["pw"] = pw
+        item["password_hash"] = pw
+    elif "pw" in item:
         item["password_hash"] = item["pw"]
-    item.pop("password", None)
+    _strip_legacy_user_fields(item)
     _users_tbl.put_item(Item=_to_ddb(item))
 
 
@@ -136,8 +164,8 @@ def ddb_all_users():
         em = item.get("email")
         if not em:
             continue
-        pw = item.get("password_hash") or item.get("password") or item.get("pw")
-        if pw and "pw" not in item:
+        pw = _resolve_stored_password(item)
+        if pw:
             item["pw"] = pw
         out[em] = item
     while "LastEvaluatedKey" in resp:
@@ -147,8 +175,8 @@ def ddb_all_users():
             em = item.get("email")
             if not em:
                 continue
-            pw = item.get("password_hash") or item.get("password") or item.get("pw")
-            if pw and "pw" not in item:
+            pw = _resolve_stored_password(item)
+            if pw:
                 item["pw"] = pw
             out[em] = item
     return out
@@ -164,8 +192,19 @@ def load():
 
 
 def save(u):
+    """Write users to DynamoDB. Prefer ddb_put_user(email, rec) for single-user updates."""
     for email, rec in u.items():
         ddb_put_user(email, rec)
+
+
+def _ddb_update_user_plan(stripe_customer_id, plan):
+    """Update one user's plan without re-writing every account (avoids password clobber)."""
+    for email, ud in ddb_all_users().items():
+        if ud.get("stripe_customer_id") == stripe_customer_id:
+            ud["plan"] = plan
+            ddb_put_user(email, ud)
+            return email
+    return None
 
 
 def _make_session(email):
@@ -672,12 +711,12 @@ def subscribe(r: Sub, user=Depends(get_user_from_token)):
         if not cid:
             c = stripe.Customer.create(email=user["email"], name=x.get("name", ""))
             cid = c.id
-            u[user["email"]]["stripe_customer_id"] = cid
+            x["stripe_customer_id"] = cid
         stripe.PaymentMethod.attach(r.payment_method_id, customer=cid)
         stripe.Customer.modify(cid, invoice_settings={"default_payment_method": r.payment_method_id})
-        u[user["email"]]["plan"] = plan
-        u[user["email"]]["billing"] = billing
-        save(u)
+        x["plan"] = plan
+        x["billing"] = billing
+        ddb_put_user(user["email"], x)
         sub = stripe.Subscription.create(
             customer=cid,
             items=[{"price": price_id}],
@@ -827,7 +866,6 @@ async def stripe_webhook(request: Request):
             event = _json.loads(payload)
     except Exception as e:
         raise HTTPException(400, str(e))
-    u = load()
     etype = event.get("type", "")
     data = event.get("data", {}).get("object", {})
     cid = data.get("customer", "")
@@ -836,23 +874,15 @@ async def stripe_webhook(request: Request):
         items = data.get("items", {}).get("data", [])
         price_id = items[0].get("price", {}).get("id", "") if items else ""
         new_plan = next((k for k, v in PRICE_IDS.items() if price_id in v.values()), None)
-        for email, ud in u.items():
-            if ud.get("stripe_customer_id") == cid:
-                if status in ("active", "trialing") and new_plan:
-                    ud["plan"] = new_plan
-                elif status in ("canceled", "unpaid", "past_due"):
-                    ud["plan"] = "starter"
-                break
-        save(u)
+        if status in ("active", "trialing") and new_plan:
+            _ddb_update_user_plan(cid, new_plan)
+        elif status in ("canceled", "unpaid", "past_due"):
+            _ddb_update_user_plan(cid, "starter")
     elif etype == "customer.subscription.deleted":
-        for email, ud in u.items():
-            if ud.get("stripe_customer_id") == cid:
-                ud["plan"] = "starter"
-                break
-        save(u)
+        _ddb_update_user_plan(cid, "starter")
     elif etype == "invoice.payment_failed":
-        for email, ud in u.items():
+        for em, ud in ddb_all_users().items():
             if ud.get("stripe_customer_id") == cid:
-                print(f"Payment failed for {email}")
+                print(f"Payment failed for {em}")
                 break
     return {"status": "ok"}
