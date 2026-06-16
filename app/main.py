@@ -1,6 +1,15 @@
 import json, os, hashlib, secrets, stripe, requests, boto3, time, hmac, bcrypt, base64, io
+from datetime import date
 from decimal import Decimal
-from urllib.parse import quote
+from urllib.parse import quote, unquote
+
+from dotenv import load_dotenv
+
+_env_path = "/home/ubuntu/risk-planner-BE/.env"
+if os.path.exists(_env_path):
+    load_dotenv(_env_path)
+else:
+    load_dotenv()
 
 import pyotp
 import qrcode
@@ -441,6 +450,7 @@ ALLOWED_PROVIDERS = {"quickbooks", "freshbooks", "xero", "wave"}
 FRONTEND_URL = "https://www.taxstat360.com"
 RESET_FROM = "noreply@taxstat360.com"
 RESET_TTL = 3600
+VERIFY_TTL = 86400
 
 
 class ForgotReq(BaseModel):
@@ -463,6 +473,34 @@ class MfaChallengeReq(BaseModel):
     code: str
 
 
+class ResendVerify(BaseModel):
+    email: str
+
+
+class ChangeEmailReq(BaseModel):
+    email: str
+    new_email: str
+
+
+def _send_verification_email(email, verify_tok):
+    verify_url = f"https://app.taxstat360.com/auth/verify-email?token={verify_tok}&email={quote(email)}"
+    html = (
+        '<div style="font-family:-apple-system,sans-serif;max-width:520px;margin:0 auto;padding:40px 24px">'
+        '<h2 style="color:#0D1B3E">Confirm your email</h2>'
+        "<p>Thanks for signing up for TaxStat360. Please confirm your email address.</p>"
+        f'<p><a href="{verify_url}" style="background:#2563EB;color:#fff;padding:12px 20px;'
+        'border-radius:8px;text-decoration:none;display:inline-block">Confirm Email</a></p>'
+        '<p style="color:#475569;font-size:13px">If you did not create this account, you can ignore this email.</p>'
+        "</div>"
+    )
+    ses = boto3.client("ses", region_name="us-east-1")
+    ses.send_email(
+        Source=RESET_FROM,
+        Destination={"ToAddresses": [email]},
+        Message={"Subject": {"Data": "Confirm your email for TaxStat360"}, "Body": {"Html": {"Data": html}}},
+    )
+
+
 @app.post("/auth/register")
 @limiter.limit("3/minute")
 def register(r: Reg, request: Request):
@@ -480,29 +518,12 @@ def register(r: Reg, request: Request):
         "stripe_customer_id": "",
         "verified": False,
         "verify_tok": verify_tok,
+        "verify_exp": int(time.time()) + VERIFY_TTL,
     }
     ddb_put_user(email, rec)
     mc_subscribe(email, r.name)
     try:
-        ses = boto3.client("ses", region_name="us-east-1")
-        verify_url = f"https://app.taxstat360.com/auth/verify-email?token={verify_tok}&email={email}"
-        ses.send_email(
-            Source="admin@taxstat360.com",
-            Destination={"ToAddresses": [email]},
-            Message={
-                "Subject": {"Data": "Verify your TaxStat360 email"},
-                "Body": {
-                    "Html": {
-                        "Data": f"""
-                    <p>Hi {r.name},</p>
-                    <p>Thanks for signing up for TaxStat360. Click below to verify your email address:</p>
-                    <p><a href="{verify_url}">Verify my email</a></p>
-                    <p>— TaxStat360</p>
-                """
-                    }
-                },
-            },
-        )
+        _send_verification_email(email, verify_tok)
     except Exception as e:
         print(f"SES verify error: {e}")
     resp = JSONResponse({"ok": True, "plan": plan, "email": email})
@@ -628,6 +649,59 @@ def auth_me(request: Request, token: str = ""):
     raise HTTPException(401, "Not authenticated")
 
 
+@app.get("/auth/verification-status")
+def verification_status(email: str = ""):
+    email = _norm_email(email)
+    x = ddb_get_user(email)
+    if not x:
+        return {"verified": False, "email": email}
+    return {"verified": bool(x.get("verified", False)), "email": email}
+
+
+@app.post("/auth/resend-verification")
+def resend_verification(r: ResendVerify):
+    email = _norm_email(r.email)
+    x = ddb_get_user(email)
+    if x:
+        verify_tok = secrets.token_hex(32)
+        x["verify_tok"] = verify_tok
+        x["verify_exp"] = int(time.time()) + VERIFY_TTL
+        x["verified"] = x.get("verified", False)
+        ddb_put_user(email, x)
+        try:
+            _send_verification_email(email, verify_tok)
+        except Exception as e:
+            print("resend verification email failed:", e)
+    return {"ok": True}
+
+
+@app.post("/auth/change-email")
+def change_email(r: ChangeEmailReq):
+    old = _norm_email(r.email)
+    new = _norm_email(r.new_email)
+    if not old or not new:
+        raise HTTPException(400, "Email required")
+    x = ddb_get_user(old)
+    if not x:
+        raise HTTPException(400, "Account not found")
+    if new != old and ddb_user_exists(new):
+        raise HTTPException(400, "Email already in use")
+    if new != old:
+        ddb_put_user(new, x)
+        _users_tbl.delete_item(Key={"email": old})
+    verify_tok = secrets.token_hex(32)
+    x = ddb_get_user(new)
+    x["verified"] = False
+    x["verify_tok"] = verify_tok
+    x["verify_exp"] = int(time.time()) + VERIFY_TTL
+    ddb_put_user(new, x)
+    try:
+        _send_verification_email(new, verify_tok)
+    except Exception as e:
+        print("change-email verification failed:", e)
+    return {"ok": True, "email": new}
+
+
 @app.post("/auth/logout")
 def auth_logout():
     resp = JSONResponse({"ok": True})
@@ -745,7 +819,7 @@ OAUTH = {
         "client_id": "0921E54B89164E24BA072A0E79741FA5",
         "redirect": "https://app.taxstat360.com/integrations/xero/callback",
         "auth_url": "https://login.xero.com/identity/connect/authorize",
-        "scope": "openid profile email",
+        "scope": "openid profile email offline_access accounting.reports.read",
     },
     "wave": {
         "client_id": "IS3R7n6dQG7IKscrPQSn4afGSJskrnToqpYik7Fp",
@@ -755,22 +829,346 @@ OAUTH = {
     },
 }
 
+TOKEN_URLS = {
+    "quickbooks": "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+    "xero": "https://identity.xero.com/connect/token",
+    "wave": "https://api.waveapps.com/oauth2/token/",
+    "freshbooks": "https://api.freshbooks.com/auth/oauth/token",
+}
+
+OAUTH_SECRET_ENV = {
+    "quickbooks": "QUICKBOOKS_CLIENT_SECRET",
+    "xero": "XERO_CLIENT_SECRET",
+    "wave": "WAVE_CLIENT_SECRET",
+    "freshbooks": "FRESHBOOKS_CLIENT_SECRET",
+}
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+ARIA_MODEL = os.environ.get("ARIA_MODEL", "gpt-4o-mini")
+ARIA_SYSTEM = (
+    "You are Aria, the TaxStat360 AI tax strategist. Help business owners with federal tax "
+    "planning, estimated payments, entity structure, deductions, and compliance-aware guidance. "
+    "Be concise, practical, and remind users this is planning guidance—not filing advice. "
+    "Never invent user-specific numbers; ask for details when needed."
+)
+
+
+def _oauth_secret(provider):
+    env_key = OAUTH_SECRET_ENV.get(provider, "")
+    return os.environ.get(env_key, "") if env_key else ""
+
+
+def _ytd_range():
+    y = date.today().year
+    return f"{y}-01-01", date.today().isoformat()
+
+
+def _pnl_result(revenue, expenses, officer_salary=0):
+    rev = float(revenue or 0)
+    exp = float(expenses or 0)
+    return {
+        "revenue": rev,
+        "expenses": exp,
+        "net_profit": rev - exp,
+        "officer_salary": float(officer_salary or 0),
+    }
+
+
+def _exchange_oauth_code(provider, code):
+    o = OAUTH[provider]
+    secret = _oauth_secret(provider)
+    if not secret:
+        raise HTTPException(500, f"OAuth not configured for {provider}")
+    if provider in ("quickbooks", "xero"):
+        creds = base64.b64encode(f"{o['client_id']}:{secret}".encode()).decode()
+        hdr = {"Authorization": f"Basic {creds}", "Content-Type": "application/x-www-form-urlencoded"}
+        body = {"grant_type": "authorization_code", "code": code, "redirect_uri": o["redirect"]}
+        r = requests.post(TOKEN_URLS[provider], data=body, headers=hdr, timeout=30)
+    elif provider == "wave":
+        r = requests.post(
+            TOKEN_URLS[provider],
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": o["client_id"],
+                "client_secret": secret,
+                "redirect_uri": o["redirect"],
+            },
+            timeout=30,
+        )
+    else:
+        r = requests.post(
+            TOKEN_URLS[provider],
+            json={
+                "grant_type": "authorization_code",
+                "client_id": o["client_id"],
+                "client_secret": secret,
+                "code": code,
+                "redirect_uri": o["redirect"],
+            },
+            timeout=30,
+        )
+    if not r.ok:
+        print(f"oauth token exchange {provider}: {r.status_code} {r.text[:300]}", flush=True)
+        raise HTTPException(400, "OAuth token exchange failed")
+    return r.json()
+
 
 @app.get("/integrations/{p}/connect")
-def connect(p: str):
+def connect(p: str, entity: str = "0"):
     if p not in ALLOWED_PROVIDERS:
         raise HTTPException(404)
     o = OAUTH[p]
+    state = quote(f"ts360|{entity}")
     return RedirectResponse(
-        f"{o['auth_url']}?client_id={o['client_id']}&redirect_uri={o['redirect']}&response_type=code&scope={o['scope']}&state=ts360"
+        f"{o['auth_url']}?client_id={o['client_id']}&redirect_uri={quote(o['redirect'])}"
+        f"&response_type=code&scope={quote(o['scope'])}&state={state}"
     )
 
 
 @app.get("/integrations/{p}/callback")
-def callback(p: str, code: str = "", state: str = ""):
+def callback(p: str, code: str = "", state: str = "", realmId: str = "", tenantId: str = ""):
     if p not in ALLOWED_PROVIDERS:
         raise HTTPException(404)
-    return RedirectResponse(url=f"https://www.taxstat360.com/dashboard?{p}=connected")
+    if not code:
+        return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=missing_code")
+    parts = unquote(state or "").split("|")
+    entity_idx = parts[-1] if len(parts) > 1 and parts[-1].isdigit() else "0"
+    access_token = ""
+    refresh_token = ""
+    realm_id = realmId or ""
+    tenant_id = tenantId or ""
+    fb_account_id = ""
+    try:
+        tok = _exchange_oauth_code(p, code)
+        access_token = tok.get("access_token", "")
+        refresh_token = tok.get("refresh_token", "")
+        if p == "xero" and not tenant_id:
+            conn = requests.get(
+                "https://api.xero.com/connections",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=30,
+            )
+            if conn.ok:
+                connections = conn.json()
+                if connections:
+                    tenant_id = connections[0].get("tenantId", "")
+        elif p == "freshbooks" and access_token:
+            me = requests.get(
+                "https://api.freshbooks.com/auth/api/v1/users/me",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Api-Version": "alpha",
+                    "Content-Type": "application/json",
+                },
+                timeout=30,
+            )
+            if me.ok:
+                fb_account_id = (
+                    me.json()
+                    .get("response", {})
+                    .get("business_memberships", [{}])[0]
+                    .get("business", {})
+                    .get("account_id", "")
+                )
+    except HTTPException:
+        return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=token_exchange")
+    except Exception as e:
+        print(f"oauth callback {p} failed:", e)
+        return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=token_exchange")
+    if not access_token:
+        return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=no_token")
+    params = [f"{p}=connected", f"entity={entity_idx}", f"{p}_token={quote(access_token)}"]
+    if p == "quickbooks":
+        params.append(f"qb_token={quote(access_token)}")
+        if realm_id:
+            params.append(f"realm={quote(realm_id)}")
+    elif p == "xero":
+        if tenant_id:
+            params.append(f"tenant={quote(tenant_id)}")
+        if refresh_token:
+            params.append(f"xero_refresh={quote(refresh_token)}")
+    elif p == "freshbooks" and fb_account_id:
+        params.append(f"account={quote(str(fb_account_id))}")
+    return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?" + "&".join(params))
+
+
+@app.get("/integrations/{p}/data")
+def integration_data(p: str, token: str = "", realm: str = "", tenant: str = "", account: str = ""):
+    if p not in ALLOWED_PROVIDERS:
+        raise HTTPException(404)
+    if not token:
+        return {"error": "missing token"}
+    start, end = _ytd_range()
+    try:
+        if p == "quickbooks":
+            if not realm:
+                return {"error": "missing realm"}
+            r = requests.get(
+                f"https://quickbooks.api.intuit.com/v3/company/{realm}/reports/ProfitAndLoss",
+                params={"start_date": start, "end_date": end},
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                timeout=30,
+            )
+            rev = exp = 0.0
+            if r.ok:
+                for row in r.json().get("Rows", {}).get("Row", []) or []:
+                    grp = row.get("group", "") or ""
+                    if not grp and row.get("Header"):
+                        grp = row["Header"].get("ColData", [{}])[0].get("value", "")
+                    summary = row.get("Summary", {}).get("ColData", [])
+                    if len(summary) < 2:
+                        continue
+                    try:
+                        amt = float(str(summary[1].get("value", "0")).replace(",", "") or 0)
+                    except ValueError:
+                        amt = 0.0
+                    gl = str(grp).lower()
+                    if "income" in gl or "revenue" in gl:
+                        rev += amt
+                    elif "expense" in gl:
+                        exp += amt
+            return _pnl_result(rev, exp)
+        if p == "xero":
+            if not tenant:
+                return {"error": "missing tenant"}
+            r = requests.get(
+                "https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss",
+                params={"fromDate": start, "toDate": end},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-tenant-id": tenant,
+                    "Accept": "application/json",
+                },
+                timeout=30,
+            )
+            rev = exp = 0.0
+            if r.ok:
+                for row in r.json().get("Reports", [{}])[0].get("Rows", []) or []:
+                    title = str(row.get("RowType", "")).lower()
+                    cells = row.get("Cells", [])
+                    if len(cells) < 2:
+                        continue
+                    try:
+                        amt = float(str(cells[1].get("Value", "0")).replace(",", "") or 0)
+                    except ValueError:
+                        amt = 0.0
+                    label = str(cells[0].get("Value", "")).lower()
+                    if title == "section" and ("income" in label or "revenue" in label):
+                        rev += amt
+                    elif title == "section" and "expense" in label:
+                        exp += amt
+            return _pnl_result(rev, exp)
+        if p == "wave":
+            q1 = {"query": "{businesses(page:1,pageSize:1){edges{node{id}}}}"}
+            br = requests.post(
+                "https://gql.waveapps.com/graphql/public",
+                json=q1,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30,
+            ).json()
+            bid = (
+                (br.get("data", {}).get("businesses", {}).get("edges", [{}]) or [{}])[0]
+                .get("node", {})
+                .get("id", "")
+            )
+            if not bid:
+                return _pnl_result(0, 0)
+            q2 = {
+                "query": (
+                    "{business(id:\"" + bid + "\"){accounts{edges{node{subtype{name}balance}}}}}"
+                )
+            }
+            ar = requests.post(
+                "https://gql.waveapps.com/graphql/public",
+                json=q2,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30,
+            ).json()
+            rev = exp = 0.0
+            for e in ar.get("data", {}).get("business", {}).get("accounts", {}).get("edges", []) or []:
+                n = e.get("node", {})
+                st = n.get("subtype", {}).get("name", "").lower()
+                try:
+                    bal = float(n.get("balance", 0) or 0)
+                except (TypeError, ValueError):
+                    bal = 0.0
+                if "income" in st or "revenue" in st or "sales" in st:
+                    rev += bal
+                elif "expense" in st or "cost" in st or "payroll" in st:
+                    exp += bal
+            return _pnl_result(rev, exp)
+        if p == "freshbooks":
+            h = {
+                "Authorization": f"Bearer {token}",
+                "Api-Version": "alpha",
+                "Content-Type": "application/json",
+            }
+            me = requests.get("https://api.freshbooks.com/auth/api/v1/users/me", headers=h, timeout=30).json()
+            aid = (
+                me.get("response", {})
+                .get("business_memberships", [{}])[0]
+                .get("business", {})
+                .get("account_id", account)
+            )
+            r = requests.get(
+                f"https://api.freshbooks.com/accounting/account/{aid}/reports/accounting/profitloss"
+                f"?start_date={start}&end_date={end}",
+                headers=h,
+                timeout=30,
+            )
+            pl = r.json().get("response", {}).get("result", {}).get("profitloss", {})
+            rev = float((pl.get("total_income", {}).get("total", {}) or {}).get("amount", 0) or 0)
+            net = float((pl.get("net_profit", {}).get("total", {}) or {}).get("amount", 0) or 0)
+            exp_raw = float((pl.get("total_expense", {}).get("total", {}) or {}).get("amount", 0) or 0)
+            exp = exp_raw if exp_raw else round(rev - net, 2)
+            return _pnl_result(rev, exp)
+    except Exception as e:
+        raise HTTPException(500, f"Provider error: {str(e)}")
+    raise HTTPException(404)
+
+
+@app.post("/aria")
+async def aria_chat(request: Request):
+    email = _require_session_user(request)
+    user = ddb_get_user(email) or {}
+    plan = user.get("plan", "starter")
+    if PLAN_ORDER.index(plan) < PLAN_ORDER.index("professional"):
+        raise HTTPException(403, "Professional plan required")
+    if not OPENAI_API_KEY:
+        raise HTTPException(503, "Aria service unavailable")
+    body = await request.json()
+    messages = body.get("messages") if isinstance(body, dict) else []
+    if not isinstance(messages, list):
+        raise HTTPException(400, "messages must be a list")
+    payload_messages = [{"role": "system", "content": ARIA_SYSTEM}]
+    for m in messages[-20:]:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "user")
+        if role not in ("user", "assistant"):
+            role = "user"
+        content = str(m.get("content", "")).strip()
+        if content:
+            payload_messages.append({"role": role, "content": content})
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"model": ARIA_MODEL, "messages": payload_messages, "max_tokens": 900},
+            timeout=60,
+        )
+    except requests.RequestException as e:
+        print("aria request failed:", e)
+        raise HTTPException(503, "Aria service unavailable")
+    if not r.ok:
+        print(f"aria openai: {r.status_code} {r.text[:300]}")
+        raise HTTPException(503, "Aria service unavailable")
+    reply = r.json()["choices"][0]["message"]["content"]
+    return {"reply": reply}
 
 
 WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
@@ -780,10 +1178,16 @@ WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 def verify_email(token: str = "", email: str = ""):
     email = _norm_email(email)
     x = ddb_get_user(email)
-    if not x or x.get("verify_tok") != token:
+    if (
+        not x
+        or not x.get("verify_tok")
+        or not secrets.compare_digest(x.get("verify_tok", ""), token)
+        or x.get("verify_exp", 0) < int(time.time())
+    ):
         raise HTTPException(400, "Invalid or expired verification link")
     x["verified"] = True
     x.pop("verify_tok", None)
+    x.pop("verify_exp", None)
     ddb_put_user(email, x)
     return RedirectResponse(url="https://www.taxstat360.com/onboarding/entity?verified=true")
 

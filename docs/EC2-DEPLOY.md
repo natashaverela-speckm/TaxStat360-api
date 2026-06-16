@@ -11,7 +11,7 @@ GitHub `taxstat360-api` is the source of truth after each deploy.
 - EC2 role `TaxStat360-EC2-SSM-Role` has DynamoDB access:
   - **Users:** `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Scan`, `DescribeTable` on `taxstat360-users`
   - **Records:** `GetItem`, `PutItem`, `DeleteItem`, `Query`, `DescribeTable` on `taxstat360-records`
-- `.env` on server includes `SECRET_KEY`, `SENDGRID_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`
+- `.env` on server includes `SECRET_KEY`, `SENDGRID_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, OAuth client secrets (`QUICKBOOKS_CLIENT_SECRET`, etc.), and `OPENAI_API_KEY` for Aria
 
 ## 1. Backup (always first)
 
@@ -137,6 +137,52 @@ curl -s -c /tmp/mfa2.txt -X POST "http://127.0.0.1:8000/auth/mfa/challenge" \
 ```
 
 Frontend: Settings → Enable 2FA (QR scan) → log out → log in → enter TOTP code.
+
+### Post-MFA route restore (verification, integrations, Aria)
+
+The M1/M2/M3 rewrite replaced the older EC2 `main.py` but dropped routes the frontend still calls. After deploying the restored `app/main.py`, confirm these return **not 404**:
+
+| Route | Expected |
+|-------|----------|
+| `GET /auth/verification-status?email=...` | `200` + `{"verified":...}` |
+| `POST /auth/resend-verification` | `200` + `{"ok":true}` |
+| `POST /aria` (session cookie) | `200` / `403` (plan) / `503` (no OpenAI key) — **not 404** |
+| `GET /integrations/quickbooks/callback` (no `code`) | redirect to `/calculate-tax?quickbooks=error` — **not** `?quickbooks=connected` |
+| `GET /integrations/{p}/data?token=...` | `200` (or provider error JSON) |
+
+**`.env` keys required for integrations + Aria** (copy OAuth client secrets from the previous live `main.py` `SECRETS={...}` block if missing):
+
+```bash
+QUICKBOOKS_CLIENT_SECRET=...
+XERO_CLIENT_SECRET=...
+WAVE_CLIENT_SECRET=...
+FRESHBOOKS_CLIENT_SECRET=...
+OPENAI_API_KEY=...          # Aria
+ARIA_MODEL=gpt-4o-mini      # optional
+```
+
+Smoke tests (Session Manager):
+
+```bash
+# Verification status (public)
+curl -s -w "\nHTTP %{http_code}\n" "http://127.0.0.1:8000/auth/verification-status?email=admin@taxstat360.com"
+
+# Aria without session → 401 not 404
+curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "http://127.0.0.1:8000/aria" \
+  -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"hi"}]}'
+
+# OAuth callback without code → error redirect, not connected
+curl -s -o /dev/null -w "HTTP %{http_code} %{redirect_url}\n" \
+  "http://127.0.0.1:8000/integrations/quickbooks/callback"
+```
+
+Public checks (from anywhere):
+
+```bash
+curl -si "https://app.taxstat360.com/auth/verification-status?email=test@example.com" | head -5
+curl -si -X POST "https://app.taxstat360.com/aria" -H "Content-Type: application/json" -d '{"messages":[]}' | head -5
+curl -si "https://app.taxstat360.com/integrations/quickbooks/callback" | head -8
+```
 
 ## 6. Sync to GitHub
 
