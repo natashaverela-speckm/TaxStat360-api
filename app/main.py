@@ -992,21 +992,44 @@ def _parse_xero_pnl(report):
     rev = cogs = opex = 0.0
     net = None
     for label, amt in summaries.items():
-        if "total income" in label:
+        if any(
+            k in label
+            for k in (
+                "total income",
+                "total revenue",
+                "total trading income",
+                "total sales",
+            )
+        ):
             rev = amt
-        elif (
-            "total cost of sales" in label
-            or "total cogs" in label
-            or "cost of goods" in label
+        elif "gross profit" in label and not rev:
+            rev = amt
+        elif any(
+            k in label
+            for k in (
+                "total cost of sales",
+                "total cogs",
+                "cost of goods",
+            )
         ):
             cogs += abs(amt)
-        elif "total operating expenses" in label or label == "total expenses":
+        elif any(
+            k in label
+            for k in (
+                "total operating expenses",
+                "total operating costs",
+                "total expenses",
+                "total expense",
+            )
+        ) and "other income" not in label:
             opex = abs(amt)
-        elif "net profit" in label:
+        elif "net profit" in label or label == "net income":
             net = amt
     exp = cogs + opex
     if net is None and (rev or exp):
         net = rev - exp
+    if not rev and not exp and net is None and summaries:
+        print(f"xero pnl unmatched summaries: {list(summaries.keys())[:20]}", flush=True)
     return rev, exp, net
 
 
@@ -1326,7 +1349,7 @@ def integration_data(
             )
             if not r.ok:
                 print(f"xero profitloss: {r.status_code} {r.text[:300]}", flush=True)
-                return {"error": "xero report failed"}
+                return {"error": "xero report failed", "status": r.status_code}
             reports = r.json().get("Reports") or []
             if not reports:
                 return {"error": "xero report empty"}
