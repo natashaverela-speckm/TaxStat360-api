@@ -862,7 +862,7 @@ OAUTH = {
         ),
         "redirect": "https://app.taxstat360.com/integrations/xero/callback",
         "auth_url": "https://login.xero.com/identity/connect/authorize",
-        "scope": "openid profile email offline_access accounting.reports.profitandloss.read",
+        "scope": "offline_access accounting.reports.read",
     },
     "wave": {
         "client_id": os.environ.get(
@@ -930,7 +930,8 @@ def _exchange_oauth_code(provider, code):
         hdr = {"Authorization": f"Basic {creds}", "Content-Type": "application/x-www-form-urlencoded"}
         body = {"grant_type": "authorization_code", "code": code, "redirect_uri": o["redirect"]}
         r = requests.post(TOKEN_URLS[provider], data=body, headers=hdr, timeout=30)
-    elif provider == "wave":
+    elif provider in ("wave", "freshbooks"):
+        # Wave + FreshBooks require application/x-www-form-urlencoded (JSON → invalid_client).
         r = requests.post(
             TOKEN_URLS[provider],
             data={
@@ -940,6 +941,7 @@ def _exchange_oauth_code(provider, code):
                 "client_secret": secret,
                 "redirect_uri": o["redirect"],
             },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=30,
         )
     else:
@@ -952,6 +954,7 @@ def _exchange_oauth_code(provider, code):
                 "code": code,
                 "redirect_uri": o["redirect"],
             },
+            headers={"Content-Type": "application/json"},
             timeout=30,
         )
     if not r.ok:
