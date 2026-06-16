@@ -909,15 +909,30 @@ def _ytd_range():
     return f"{y}-01-01", date.today().isoformat()
 
 
-def _pnl_result(revenue, expenses, officer_salary=0):
+def _pnl_result(revenue, expenses, officer_salary=0, net_profit=None):
     rev = float(revenue or 0)
     exp = float(expenses or 0)
+    net = float(net_profit) if net_profit is not None else rev - exp
     return {
         "revenue": rev,
         "expenses": exp,
-        "net_profit": rev - exp,
+        "net_profit": net,
         "officer_salary": float(officer_salary or 0),
     }
+
+
+def _fb_pl_amount(pl, *keys):
+    """Read FreshBooks P&L nested total.amount (e.g. total_income = Gross Profit)."""
+    for key in keys:
+        block = pl.get(key) or {}
+        total = block.get("total") or {}
+        amt = total.get("amount")
+        if amt is not None and str(amt).strip() != "":
+            try:
+                return float(str(amt).replace(",", ""))
+            except ValueError:
+                continue
+    return 0.0
 
 
 def _exchange_oauth_code(provider, code):
@@ -1051,6 +1066,7 @@ def callback(p: str, code: str = "", state: str = "", realmId: str = "", tenantI
             params.append(f"xero_refresh={quote(refresh_token)}")
     elif p == "freshbooks" and fb_account_id:
         params.append(f"account={quote(str(fb_account_id))}")
+        params.append(f"fb_token={quote(access_token)}")
     return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?" + "&".join(params))
 
 
@@ -1172,18 +1188,23 @@ def integration_data(p: str, token: str = "", realm: str = "", tenant: str = "",
                 .get("business", {})
                 .get("account_id", account)
             )
+            if not aid:
+                return {"error": "missing freshbooks account"}
             r = requests.get(
                 f"https://api.freshbooks.com/accounting/account/{aid}/reports/accounting/profitloss"
                 f"?start_date={start}&end_date={end}",
                 headers=h,
                 timeout=30,
             )
+            if not r.ok:
+                print(f"freshbooks profitloss: {r.status_code} {r.text[:300]}", flush=True)
+                return {"error": "freshbooks report failed"}
             pl = r.json().get("response", {}).get("result", {}).get("profitloss", {})
-            rev = float((pl.get("total_income", {}).get("total", {}) or {}).get("amount", 0) or 0)
-            net = float((pl.get("net_profit", {}).get("total", {}) or {}).get("amount", 0) or 0)
-            exp_raw = float((pl.get("total_expense", {}).get("total", {}) or {}).get("amount", 0) or 0)
-            exp = exp_raw if exp_raw else round(rev - net, 2)
-            return _pnl_result(rev, exp)
+            # FreshBooks labels total_income as "Gross Profit" in the P&L report.
+            gross = _fb_pl_amount(pl, "total_income", "gross_profit")
+            exp = _fb_pl_amount(pl, "total_expenses", "total_expense")
+            net = _fb_pl_amount(pl, "net_profit")
+            return _pnl_result(gross, exp, net_profit=net)
     except Exception as e:
         raise HTTPException(500, f"Provider error: {str(e)}")
     raise HTTPException(404)
