@@ -866,7 +866,10 @@ OAUTH = {
         ),
         "redirect": "https://app.taxstat360.com/integrations/xero/callback",
         "auth_url": "https://login.xero.com/identity/connect/authorize",
-        "scope": "openid profile email offline_access accounting.reports.profitandloss.read",
+        "scope": os.environ.get(
+            "XERO_SCOPE",
+            "openid profile email offline_access accounting.reports.profitandloss.read",
+        ),
     },
     "wave": {
         "client_id": os.environ.get(
@@ -1220,6 +1223,11 @@ def callback(p: str, code: str = "", state: str = "", realmId: str = "", tenantI
                 connections = conn.json()
                 if connections:
                     tenant_id = connections[0].get("tenantId", "")
+            else:
+                print(
+                    f"xero connections: {conn.status_code} {conn.text[:300]}",
+                    flush=True,
+                )
         elif p == "freshbooks" and access_token:
             me = requests.get(
                 "https://api.freshbooks.com/auth/api/v1/users/me",
@@ -1251,8 +1259,11 @@ def callback(p: str, code: str = "", state: str = "", realmId: str = "", tenantI
         if realm_id:
             params.append(f"realm={quote(realm_id)}")
     elif p == "xero":
-        if tenant_id:
-            params.append(f"tenant={quote(tenant_id)}")
+        if not tenant_id:
+            return RedirectResponse(
+                url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=missing_tenant"
+            )
+        params.append(f"tenant={quote(tenant_id)}")
         if refresh_token:
             params.append(f"xero_refresh={quote(refresh_token)}")
     elif p == "freshbooks" and fb_account_id:
