@@ -57,6 +57,17 @@ Do **not** leave the service stopped.
 
 ## 5. Smoke tests
 
+> **Required regression guard — run after every restart.** A deploy is not complete until this passes:
+>
+> ```bash
+> bash scripts/smoke_check.sh                       # default target: http://127.0.0.1:8000
+> # or against the public edge:
+> BASE=https://app.taxstat360.com bash scripts/smoke_check.sh
+> ```
+>
+> It probes the critical routes — `/aria`, `/auth/verification-status`, `/auth/me`, `/records` — and **exits non-zero if any returns 404**. This catches the exact regression the MFA refactor caused (dropped routes) before it can ship silently. Unit-test equivalent: `pytest tests/test_routes_registered.py`.
+
+
 ```bash
 # Unauthenticated
 curl -s -m 5 -w "\nHTTP %{http_code}\n" "http://127.0.0.1:8000/auth/me"
