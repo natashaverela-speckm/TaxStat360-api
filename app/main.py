@@ -1031,8 +1031,9 @@ def setup():
 
 
 @app.post("/stripe/subscribe")
-def subscribe(r: Sub, user=Depends(get_user_from_token)):
+def subscribe(r: Sub, request: Request):
     try:
+        user = {"email": _require_session_user(request)}
         u = load()
         x = u.get(user["email"])
         if not x:
