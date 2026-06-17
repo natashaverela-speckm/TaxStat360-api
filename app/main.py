@@ -1051,12 +1051,28 @@ def subscribe(r: Sub, request: Request):
         x["plan"] = plan
         x["billing"] = billing
         ddb_put_user(user["email"], x)
-        sub = stripe.Subscription.create(
-            customer=cid,
-            items=[{"price": price_id}],
-            trial_period_days=7,
-            default_payment_method=r.payment_method_id,
-        )
+        existing = stripe.Subscription.list(customer=cid, status="all", limit=10)
+        active = None
+        for _s in existing.auto_paging_iter():
+            if _s.status in ("active", "trialing", "past_due", "unpaid"):
+                active = _s
+                break
+        if active:
+            _item_id = active["items"]["data"][0]["id"]
+            _proration = "none" if active.status == "trialing" else "always_invoice"
+            sub = stripe.Subscription.modify(
+                active.id,
+                items=[{"id": _item_id, "price": price_id}],
+                proration_behavior=_proration,
+                default_payment_method=r.payment_method_id,
+            )
+        else:
+            sub = stripe.Subscription.create(
+                customer=cid,
+                items=[{"price": price_id}],
+                trial_period_days=7,
+                default_payment_method=r.payment_method_id,
+            )
         return {"status": "ok", "customer_id": cid, "subscription_id": sub.id}
     except Exception as e:
         raise HTTPException(400, str(e))
