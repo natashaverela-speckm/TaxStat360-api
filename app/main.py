@@ -1,7 +1,9 @@
-import json, os, hashlib, secrets, stripe, requests, boto3, time, hmac, bcrypt, base64, io
+import json, logging, os, hashlib, secrets, stripe, requests, boto3, time, hmac, bcrypt, base64, io
 from datetime import date
 from decimal import Decimal
 from urllib.parse import quote, unquote
+
+logger = logging.getLogger("taxstat360")
 
 from dotenv import load_dotenv
 
@@ -347,8 +349,8 @@ def _ensure_audit_table():
     try:
         _audit_tbl.load()
         return
-    except Exception:
-        pass
+    except Exception as e:
+        logger.info("audit table load skipped (will try create): %s", e)
     try:
         _ddb.create_table(
             TableName=AUDIT_TABLE,
@@ -598,8 +600,8 @@ def mc_subscribe(email, name=""):
             },
             timeout=5,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("mailchimp subscribe failed for %s: %s", email, e)
 
 
 def get_user_from_token(request: Request):
@@ -1021,13 +1023,26 @@ def admin_delete_user(target_email: str, request: Request):
     return JSONResponse(result)
 
 
+_STRIPE_CLIENT_MESSAGE = "Payment request could not be completed. Please try again."
+
+
+def _stripe_route_error(exc, *, context):
+    if isinstance(exc, HTTPException):
+        raise exc
+    if isinstance(exc, stripe.error.StripeError):
+        logger.warning("%s: %s", context, exc)
+        raise HTTPException(400, _STRIPE_CLIENT_MESSAGE)
+    logger.exception("%s: unexpected error", context)
+    raise HTTPException(500, _STRIPE_CLIENT_MESSAGE)
+
+
 @app.post("/stripe/setup-intent")
 def setup():
     try:
         i = stripe.SetupIntent.create(usage="off_session")
         return {"client_secret": i.client_secret}
     except Exception as e:
-        raise HTTPException(400, str(e))
+        _stripe_route_error(e, context="stripe setup-intent")
 
 
 @app.post("/stripe/subscribe")
@@ -1075,39 +1090,31 @@ def subscribe(r: Sub, request: Request):
             )
         return {"status": "ok", "customer_id": cid, "subscription_id": sub.id}
     except Exception as e:
-        raise HTTPException(400, str(e))
+        _stripe_route_error(e, context="stripe subscribe")
 
 
-OAUTH = {
-    # Production app credentials (must match QUICKBOOKS_CLIENT_SECRET etc. in .env).
-    # Prior git client_ids were a different OAuth app registration — token exchange failed.
+OAUTH_CLIENT_ID_ENV = {
+    "quickbooks": "QUICKBOOKS_CLIENT_ID",
+    "freshbooks": "FRESHBOOKS_CLIENT_ID",
+    "xero": "XERO_CLIENT_ID",
+    "wave": "WAVE_CLIENT_ID",
+}
+
+_OAUTH_STATIC = {
     "quickbooks": {
-        "client_id": os.environ.get(
-            "QUICKBOOKS_CLIENT_ID",
-            "AB1FhVS3wJV2oOLUXNS8ZlnCHuUFW3XTM20rOydbCln0Pj1vZG",
-        ),
         "redirect": "https://app.taxstat360.com/integrations/quickbooks/callback",
         "auth_url": "https://appcenter.intuit.com/app/connect/oauth2",
         "scope": "com.intuit.quickbooks.accounting",
     },
     "freshbooks": {
-        "client_id": os.environ.get(
-            "FRESHBOOKS_CLIENT_ID",
-            "47b688958adf0a8250c4e799d5a258509e5e4f7bdbb7b0940ba2893ce13b7f03",
-        ),
         "redirect": "https://app.taxstat360.com/integrations/freshbooks/callback",
         "auth_url": "https://auth.freshbooks.com/oauth/authorize/",
-        # user:reports:read required for P&L — must be enabled on the app in FreshBooks Developer.
         "scope": os.environ.get(
             "FRESHBOOKS_SCOPE",
             "user:profile:read user:reports:read",
         ),
     },
     "xero": {
-        "client_id": os.environ.get(
-            "XERO_CLIENT_ID",
-            "B264F13CC72F458AA766E9627ABA95E2",
-        ),
         "redirect": "https://app.taxstat360.com/integrations/xero/callback",
         "auth_url": "https://login.xero.com/identity/connect/authorize",
         "scope": os.environ.get(
@@ -1116,15 +1123,23 @@ OAUTH = {
         ),
     },
     "wave": {
-        "client_id": os.environ.get(
-            "WAVE_CLIENT_ID",
-            "tV2wa6N3ltIhHVu1S4lgz_CP48xm8loeF4zczbTY",
-        ),
         "redirect": "https://app.taxstat360.com/integrations/wave/callback",
         "auth_url": "https://api.waveapps.com/oauth2/authorize/",
         "scope": "account:* business:read",
     },
 }
+
+
+def _oauth_config(provider):
+    p = (provider or "").lower()
+    if p not in _OAUTH_STATIC:
+        raise HTTPException(404, "Unknown provider")
+    env_key = OAUTH_CLIENT_ID_ENV[p]
+    client_id = (os.environ.get(env_key) or "").strip()
+    if not client_id:
+        logger.error("OAuth client id missing provider=%s env=%s", p, env_key)
+        raise HTTPException(503, f"{p} integration is not configured")
+    return {**_OAUTH_STATIC[p], "client_id": client_id}
 
 TOKEN_URLS = {
     "quickbooks": "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
@@ -1189,7 +1204,7 @@ def _ytd_range():
 def _xero_refresh_access_token(refresh_token):
     if not refresh_token:
         return None
-    o = OAUTH["xero"]
+    o = _oauth_config("xero")
     secret = _oauth_secret("xero")
     if not secret:
         return None
@@ -1446,7 +1461,7 @@ def _freshbooks_token_exchange(o, secret, code):
 
 
 def _exchange_oauth_code(provider, code):
-    o = OAUTH[provider]
+    o = _oauth_config(provider)
     secret = _oauth_secret(provider)
     if not secret:
         raise HTTPException(500, f"OAuth not configured for {provider}")
@@ -1493,7 +1508,7 @@ def _exchange_oauth_code(provider, code):
 def connect(p: str, entity: str = "0"):
     if p not in ALLOWED_PROVIDERS:
         raise HTTPException(404)
-    o = OAUTH[p]
+    o = _oauth_config(p)
     state = quote(f"ts360|{entity}")
     return RedirectResponse(
         f"{o['auth_url']}?client_id={o['client_id']}&redirect_uri={quote(o['redirect'])}"
@@ -1716,8 +1731,11 @@ def integration_data(
             exp = _fb_pl_amount(pl, "total_expenses", "total_expense")
             net = _fb_pl_amount(pl, "net_profit")
             return _pnl_result(gross, exp, net_profit=net)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(500, f"Provider error: {str(e)}")
+        logger.exception("integration data provider=%s failed", p)
+        raise HTTPException(500, "Provider request failed")
     raise HTTPException(404)
 
 
@@ -1857,12 +1875,18 @@ async def stripe_webhook(request: Request):
 
     try:
         if WEBHOOK_SECRET:
-            stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
-            event = _json.loads(payload)
+            event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
         else:
             event = _json.loads(payload)
+    except stripe.error.SignatureVerificationError:
+        logger.warning("stripe webhook signature verification failed")
+        raise HTTPException(400, "Invalid webhook signature")
+    except (ValueError, TypeError) as e:
+        logger.warning("stripe webhook payload invalid: %s", e)
+        raise HTTPException(400, "Invalid webhook payload")
     except Exception as e:
-        raise HTTPException(400, str(e))
+        logger.exception("stripe webhook unexpected error")
+        raise HTTPException(400, "Invalid webhook payload")
     etype = event.get("type", "")
     data = event.get("data", {}).get("object", {})
     cid = data.get("customer", "")
