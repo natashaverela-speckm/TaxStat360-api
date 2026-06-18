@@ -11,7 +11,26 @@ GitHub `taxstat360-api` is the source of truth after each deploy.
 - EC2 role `TaxStat360-EC2-SSM-Role` has DynamoDB access:
   - **Users:** `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Scan`, `DescribeTable` on `taxstat360-users`
   - **Records:** `GetItem`, `PutItem`, `DeleteItem`, `Query`, `DescribeTable` on `taxstat360-records`
-- `.env` on server includes `SECRET_KEY`, `SENDGRID_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, OAuth client secrets (`QUICKBOOKS_CLIENT_SECRET`, etc.), and `OPENAI_API_KEY` for Aria
+- `.env` on server includes `SECRET_KEY`, `SENDGRID_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, OAuth credentials (client IDs **and** secrets), and `OPENAI_API_KEY` for Aria
+
+**OAuth env vars (required — no hardcoded fallbacks in code):**
+
+| Variable | Purpose |
+|----------|---------|
+| `QUICKBOOKS_CLIENT_ID` | Intuit OAuth app client ID |
+| `QUICKBOOKS_CLIENT_SECRET` | Intuit OAuth client secret |
+| `FRESHBOOKS_CLIENT_ID` | FreshBooks OAuth client ID |
+| `FRESHBOOKS_CLIENT_SECRET` | FreshBooks OAuth client secret |
+| `XERO_CLIENT_ID` | Xero OAuth client ID |
+| `XERO_CLIENT_SECRET` | Xero OAuth client secret |
+| `WAVE_CLIENT_ID` | Wave OAuth client ID |
+| `WAVE_CLIENT_SECRET` | Wave OAuth client secret |
+
+Before deploying a build that removes inline OAuth client-ID defaults, confirm all eight values are set on the box:
+
+```bash
+grep -E '^(QUICKBOOKS|FRESHBOOKS|XERO|WAVE)_(CLIENT_ID|CLIENT_SECRET)=' /home/ubuntu/risk-planner-BE/.env
+```
 
 ## 1. Backup (always first)
 
@@ -161,13 +180,17 @@ The M1/M2/M3 rewrite replaced the older EC2 `main.py` but dropped routes the fro
 | `GET /integrations/quickbooks/callback` (no `code`) | redirect to `/calculate-tax?quickbooks=error` — **not** `?quickbooks=connected` |
 | `GET /integrations/{p}/data?token=...` | `200` (or provider error JSON) |
 
-**`.env` keys required for integrations + Aria** (copy OAuth client secrets from the previous live `main.py` `SECRETS={...}` block if missing):
+**`.env` keys required for integrations + Aria** (client IDs and secrets — verify on the box before deploy):
 
 ```bash
+QUICKBOOKS_CLIENT_ID=...
 QUICKBOOKS_CLIENT_SECRET=...
-XERO_CLIENT_SECRET=...
-WAVE_CLIENT_SECRET=...
+FRESHBOOKS_CLIENT_ID=...
 FRESHBOOKS_CLIENT_SECRET=...
+XERO_CLIENT_ID=...
+XERO_CLIENT_SECRET=...
+WAVE_CLIENT_ID=...
+WAVE_CLIENT_SECRET=...
 OPENAI_API_KEY=...          # Aria
 ARIA_MODEL=gpt-4o-mini      # optional
 ```
