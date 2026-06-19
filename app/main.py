@@ -360,7 +360,7 @@ def _ensure_audit_table():
         )
         _audit_tbl.wait_until_exists()
     except Exception as e:
-        print(f"AUDIT table auto-create skipped: {e}", flush=True)
+        logger.warning("AUDIT table auto-create skipped: %s", e)
 
 
 def _write_audit(action, actor_email, target_email, status, detail=None):
@@ -378,9 +378,8 @@ def _write_audit(action, actor_email, target_email, status, detail=None):
         _audit_tbl.put_item(Item=_to_ddb(item))
         return {"ok": True, "auditId": item["auditId"]}
     except Exception as e:
-        # Loud, not silent: surfaced in logs and in the API response's audit flag.
-        print(f"AUDIT write failed ({status}) target={target_email}: {e}", flush=True)
-        return {"ok": False, "error": str(e)}
+        logger.exception("AUDIT write failed (%s) target=%s", status, target_email)
+        return {"ok": False, "error": "Audit log write failed"}
 
 
 def _stripe_is_missing(e):
@@ -521,7 +520,7 @@ def _get_mfa_secret(x, email=None):
         try:
             return _mfa_decrypt(enc)
         except Exception as e:
-            print(f"MFA decrypt failed for {email or '?'}: {e}", flush=True)
+            logger.warning("MFA decrypt failed: %s", e)
     plain = x.get("mfa_secret")
     if plain:
         secret = str(plain)
@@ -531,7 +530,7 @@ def _get_mfa_secret(x, email=None):
             if email:
                 ddb_put_user(email, x)
         except Exception as e:
-            print(f"MFA legacy migrate failed for {email or '?'}: {e}", flush=True)
+            logger.warning("MFA legacy migrate failed: %s", e)
         return secret
     return None
 
@@ -692,7 +691,6 @@ class ResendVerify(BaseModel):
 
 
 class ChangeEmailReq(BaseModel):
-    email: str
     new_email: str
 
 
@@ -739,7 +737,7 @@ def register(r: Reg, request: Request):
     try:
         _send_verification_email(email, verify_tok)
     except Exception as e:
-        print(f"SES verify error: {e}")
+        logger.warning("SES verify error: %s", e)
     resp = JSONResponse({"ok": True, "plan": plan, "email": email})
     _set_session_cookie(resp, email)
     return resp
@@ -895,16 +893,16 @@ def resend_verification(r: ResendVerify):
         try:
             _send_verification_email(email, verify_tok)
         except Exception as e:
-            print("resend verification email failed:", e)
+            logger.warning("resend verification email failed: %s", e)
     return {"ok": True}
 
 
 @app.post("/auth/change-email")
-def change_email(r: ChangeEmailReq):
-    old = _norm_email(r.email)
+def change_email(request: Request, r: ChangeEmailReq):
+    old = _require_session_user(request)
     new = _norm_email(r.new_email)
-    if not old or not new:
-        raise HTTPException(400, "Email required")
+    if not new:
+        raise HTTPException(400, "New email required")
     x = ddb_get_user(old)
     if not x:
         raise HTTPException(400, "Account not found")
@@ -922,8 +920,11 @@ def change_email(r: ChangeEmailReq):
     try:
         _send_verification_email(new, verify_tok)
     except Exception as e:
-        print("change-email verification failed:", e)
-    return {"ok": True, "email": new}
+        logger.warning("change-email verification email failed: %s", e)
+    resp = JSONResponse({"ok": True, "email": new})
+    if new != old:
+        _set_session_cookie(resp, new)
+    return resp
 
 
 @app.post("/auth/logout")
@@ -1219,7 +1220,7 @@ def _xero_refresh_access_token(refresh_token):
         timeout=30,
     )
     if not r.ok:
-        print(f"xero token refresh: {r.status_code} {r.text[:200]}", flush=True)
+        logger.warning("xero token refresh: %s %s", r.status_code, r.text[:200])
         return None
     return r.json().get("access_token")
 
@@ -1323,10 +1324,7 @@ def _parse_xero_pnl(report):
             rev, exp = sec_inc, sec_exp
             net = rev - exp
     if not rev and not exp and net is None and summaries:
-        print(
-            f"xero pnl unmatched summaries: {list(summaries.keys())[:25]}",
-            flush=True,
-        )
+        logger.info("xero pnl unmatched summaries: %s", list(summaries.keys())[:25])
     return rev, exp, net, summaries
 
 
@@ -1452,11 +1450,15 @@ def _freshbooks_token_exchange(o, secret, code):
         r = req()
         last = r
         if r.ok:
-            print(f"freshbooks token exchange ok via {name}", flush=True)
+            logger.info("freshbooks token exchange ok via %s", name)
             return r.json()
-        print(f"freshbooks token exchange {name}: {r.status_code} {r.text[:200]}", flush=True)
+        logger.warning("freshbooks token exchange %s: %s %s", name, r.status_code, r.text[:200])
     if last is not None:
-        print(f"oauth token exchange freshbooks: {last.status_code} {last.text[:300]}", flush=True)
+        logger.warning(
+            "oauth token exchange freshbooks: %s %s",
+            last.status_code,
+            last.text[:300],
+        )
     raise HTTPException(400, "OAuth token exchange failed")
 
 
@@ -1499,7 +1501,7 @@ def _exchange_oauth_code(provider, code):
             timeout=30,
         )
     if not r.ok:
-        print(f"oauth token exchange {provider}: {r.status_code} {r.text[:300]}", flush=True)
+        logger.warning("oauth token exchange %s: %s %s", provider, r.status_code, r.text[:300])
         raise HTTPException(400, "OAuth token exchange failed")
     return r.json()
 
@@ -1544,10 +1546,7 @@ def callback(p: str, code: str = "", state: str = "", realmId: str = "", tenantI
                 if connections:
                     tenant_id = connections[0].get("tenantId", "")
             else:
-                print(
-                    f"xero connections: {conn.status_code} {conn.text[:300]}",
-                    flush=True,
-                )
+                logger.warning("xero connections: %s %s", conn.status_code, conn.text[:300])
         elif p == "freshbooks" and access_token:
             me = requests.get(
                 "https://api.freshbooks.com/auth/api/v1/users/me",
@@ -1569,7 +1568,7 @@ def callback(p: str, code: str = "", state: str = "", realmId: str = "", tenantI
     except HTTPException:
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=token_exchange")
     except Exception as e:
-        print(f"oauth callback {p} failed:", e)
+        logger.exception("oauth callback %s failed", p)
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=token_exchange")
     if not access_token:
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=no_token")
@@ -1622,7 +1621,7 @@ def integration_data(
                 timeout=30,
             )
             if not r.ok:
-                print(f"quickbooks profitloss: {r.status_code} {r.text[:300]}", flush=True)
+                logger.warning("quickbooks profitloss: %s %s", r.status_code, r.text[:300])
                 return {"error": "quickbooks report failed"}
             rev, exp, net = _parse_qb_pnl(r.json())
             return _pnl_result(rev, exp, net_profit=net)
@@ -1645,7 +1644,7 @@ def integration_data(
                 timeout=30,
             )
             if not r.ok:
-                print(f"xero profitloss: {r.status_code} {r.text[:300]}", flush=True)
+                logger.warning("xero profitloss: %s %s", r.status_code, r.text[:300])
                 return {"error": "xero report failed", "status": r.status_code}
             reports = r.json().get("Reports") or []
             if not reports:
@@ -1723,7 +1722,7 @@ def integration_data(
                 timeout=30,
             )
             if not r.ok:
-                print(f"freshbooks profitloss: {r.status_code} {r.text[:300]}", flush=True)
+                logger.warning("freshbooks profitloss: %s %s", r.status_code, r.text[:300])
                 return {"error": "freshbooks report failed"}
             pl = r.json().get("response", {}).get("result", {}).get("profitloss", {})
             # FreshBooks labels total_income as "Gross Profit" in the P&L report.
@@ -1773,10 +1772,10 @@ async def aria_chat(request: Request):
             timeout=60,
         )
     except requests.RequestException as e:
-        print("aria request failed:", e)
+        logger.warning("aria request failed: %s", e)
         raise HTTPException(503, "Aria service unavailable")
     if not r.ok:
-        print(f"aria openai: {r.status_code} {r.text[:300]}")
+        logger.warning("aria openai: %s %s", r.status_code, r.text[:300])
         raise HTTPException(503, "Aria service unavailable")
     reply = r.json()["choices"][0]["message"]["content"]
     return {"reply": reply}
@@ -1841,7 +1840,7 @@ def forgot_password(r: ForgotReq, request: Request):
                 },
             )
         except Exception as e:
-            print("password reset email failed:", e)
+            logger.warning("password reset email failed: %s", e)
     return {"ok": True}
 
 
@@ -1904,6 +1903,6 @@ async def stripe_webhook(request: Request):
     elif etype == "invoice.payment_failed":
         for em, ud in ddb_all_users().items():
             if ud.get("stripe_customer_id") == cid:
-                print(f"Payment failed for {em}")
+                logger.warning("invoice.payment_failed for stripe customer %s", cid)
                 break
     return {"status": "ok"}

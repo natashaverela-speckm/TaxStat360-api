@@ -104,3 +104,20 @@ def test_oauth_connect_uses_env_client_id(client):
     loc = r.headers.get("location", "")
     assert "client_id=qb-test-client-id" in loc
     assert "AB1FhVS3wJV2oOLUXNS8ZlnCHuUFW3XTM20rOydbCln0Pj1vZG" not in loc
+
+
+def test_audit_write_failure_does_not_leak_exception_text(main, monkeypatch):
+    def _boom(*args, **kwargs):
+        raise RuntimeError("super-secret-dynamodb-detail")
+
+    monkeypatch.setattr(main._audit_tbl, "put_item", _boom)
+
+    result = main._write_audit(
+        "account.delete",
+        "actor@example.com",
+        "target@example.com",
+        "started",
+    )
+    assert result["ok"] is False
+    assert result["error"] == "Audit log write failed"
+    assert "super-secret-dynamodb-detail" not in result["error"]
