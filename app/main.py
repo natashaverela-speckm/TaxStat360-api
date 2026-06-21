@@ -978,6 +978,15 @@ async def upsert_record(request: Request):
     item["updatedAt"] = updated_at
     item["userId"] = user_id
     item["recordId"] = record_id
+    # FINDING 5 FIX: stamp every record write with the raw session token (first 16
+    # chars — enough to correlate with server logs, not enough to reuse as a credential)
+    # and the originating IP. When an unexplained write appears in DynamoDB, these two
+    # fields immediately identify which device/session was responsible without needing
+    # to reconstruct the event from access logs.
+    raw_session = request.cookies.get(SESSION_COOKIE, "")
+    item["writtenBySession"] = raw_session[:16] if raw_session else ""
+    item["writtenByIp"] = request.headers.get("x-forwarded-for", request.client.host if request.client else "")
+    item["writtenAt"] = now
     _records_tbl.put_item(Item=_to_ddb(item))
     return _record_from_item(item)
 
