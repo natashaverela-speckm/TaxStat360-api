@@ -420,6 +420,17 @@ def _write_audit(action, actor_email, target_email, status, detail=None):
         return {"ok": False, "error": "Audit log write failed"}
 
 
+def _stripe_get(obj, key, default=None):
+    """Read a field from a Stripe SDK object or plain dict (StripeObject has no .get)."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    try:
+        val = obj[key]
+    except (KeyError, TypeError):
+        return default
+    return default if val is None else val
+
+
 def _stripe_is_missing(e):
     """True when a Stripe error means the resource is already gone (idempotent)."""
     code = getattr(e, "code", "") or ""
@@ -461,10 +472,11 @@ def _stripe_teardown(stripe_customer_id):
     try:
         subs = stripe.Subscription.list(customer=stripe_customer_id, status="all", limit=100)
         for s in subs.auto_paging_iter():
-            if s.get("status") in ("canceled", "incomplete_expired"):
+            status = _stripe_get(s, "status")
+            if status in ("canceled", "incomplete_expired"):
                 continue
             try:
-                stripe.Subscription.cancel(s.get("id"))
+                stripe.Subscription.cancel(_stripe_get(s, "id"))
                 result["subscriptions_canceled"] += 1
             except Exception as e:
                 if not _stripe_is_missing(e):
@@ -535,10 +547,11 @@ def _perform_account_deletion(target_email, actor_email):
         raise HTTPException(400, "Target email required")
     _ensure_audit_table()
     user = ddb_get_user(target_email)  # may be None on an idempotent re-run
+    user_rec = user if isinstance(user, dict) else {}
     logger.info("account.delete started actor=%s target=%s", actor_email, target_email)
     _write_audit("account.delete", actor_email, target_email, "started")
     try:
-        stripe_cid = (user or {}).get("stripe_customer_id", "")
+        stripe_cid = user_rec.get("stripe_customer_id", "") or ""
         # 1 + 2. Stripe first: a hard failure here aborts before any DB delete.
         stripe_result = _stripe_teardown(stripe_cid)
         logger.info(
@@ -571,6 +584,12 @@ def _perform_account_deletion(target_email, actor_email):
     except Exception as e:
         # Stripe (or an unexpected DB) failure: record it and surface a clear error.
         # On a Stripe failure no DB rows were touched, so the account is intact.
+        logger.exception(
+            "account.delete failed actor=%s target=%s type=%s",
+            actor_email,
+            target_email,
+            type(e).__name__,
+        )
         _write_audit("account.delete", actor_email, target_email, "failed", detail=str(e))
         raise HTTPException(502, f"Account deletion failed before completion: {e}")
 
