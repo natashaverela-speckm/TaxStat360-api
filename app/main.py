@@ -424,7 +424,24 @@ def _stripe_is_missing(e):
     """True when a Stripe error means the resource is already gone (idempotent)."""
     code = getattr(e, "code", "") or ""
     msg = str(getattr(e, "user_message", "") or e)
-    return code == "resource_missing" or "no such" in msg.lower()
+    err = getattr(e, "error", None)
+    if isinstance(err, dict):
+        code = code or str(err.get("code", "") or "")
+        msg = f"{msg} {err.get('message', '')}".strip()
+    json_body = getattr(e, "json_body", None) or {}
+    if isinstance(json_body, dict):
+        err_obj = json_body.get("error") or {}
+        if isinstance(err_obj, dict):
+            code = code or str(err_obj.get("code", "") or "")
+            msg = f"{msg} {err_obj.get('message', '')}".strip()
+    if code == "resource_missing":
+        return True
+    if getattr(e, "http_status", None) == 404:
+        return True
+    lowered = msg.lower()
+    if "no such customer" in lowered or "no such" in lowered:
+        return True
+    return "has been deleted" in lowered and "customer" in lowered
 
 
 def _stripe_teardown(stripe_customer_id):
@@ -454,16 +471,36 @@ def _stripe_teardown(stripe_customer_id):
                     raise
     except Exception as e:
         if _stripe_is_missing(e):
+            logger.info(
+                "stripe teardown: customer already absent on subscription.list customer=%s (%s)",
+                stripe_customer_id,
+                e,
+            )
             result["already_absent"] = True
             return result
+        logger.warning(
+            "stripe teardown: subscription.list failed customer=%s (%s)",
+            stripe_customer_id,
+            e,
+        )
         raise
     try:
         stripe.Customer.delete(stripe_customer_id)
         result["customer_deleted"] = True
     except Exception as e:
         if _stripe_is_missing(e):
+            logger.info(
+                "stripe teardown: customer already absent on customer.delete customer=%s (%s)",
+                stripe_customer_id,
+                e,
+            )
             result["already_absent"] = True
         else:
+            logger.warning(
+                "stripe teardown: customer.delete failed customer=%s (%s)",
+                stripe_customer_id,
+                e,
+            )
             raise
     return result
 
