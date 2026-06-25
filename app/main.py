@@ -404,12 +404,12 @@ def _stripe_teardown(stripe_customer_id):
         result["already_absent"] = True
         return result
     try:
-        subs = stripe.Subscription.list(customer=stripe_customer_id, status="all", limit=100, timeout=10)
+        subs = stripe.Subscription.list(customer=stripe_customer_id, status="all", limit=100)
         for s in subs.auto_paging_iter():
             if s.get("status") in ("canceled", "incomplete_expired"):
                 continue
             try:
-                stripe.Subscription.cancel(s.get("id"), timeout=10)
+                stripe.Subscription.cancel(s.get("id"))
                 result["subscriptions_canceled"] += 1
             except Exception as e:
                 if not _stripe_is_missing(e):
@@ -420,7 +420,7 @@ def _stripe_teardown(stripe_customer_id):
             return result
         raise
     try:
-        stripe.Customer.delete(stripe_customer_id, timeout=10)
+        stripe.Customer.delete(stripe_customer_id)
         result["customer_deleted"] = True
     except Exception as e:
         if _stripe_is_missing(e):
