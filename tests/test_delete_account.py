@@ -121,6 +121,44 @@ def test_idempotent_stripe_already_gone(client, main, monkeypatch):
     assert main.ddb_get_user(email) is None
 
 
+def test_delete_when_stripe_customer_manually_removed(client, main, monkeypatch):
+    """DB still has stripe_customer_id but customer was deleted in Stripe Dashboard."""
+    import stripe
+
+    email = "stripe-gone@example.com"
+    _mk_user(main, email, stripe_customer_id="cus_deleted_in_dashboard")
+    _auth(client, main, email)
+
+    def _list_deleted_customer(*a, **k):
+        raise stripe.error.InvalidRequestError(
+            "No such customer: 'cus_deleted_in_dashboard'",
+            param="customer",
+            http_status=404,
+        )
+
+    delete_called = []
+
+    def _customer_delete(cid):
+        delete_called.append(cid)
+        raise stripe.error.InvalidRequestError(
+            "No such customer: 'cus_deleted_in_dashboard'",
+            param="id",
+            code="resource_missing",
+            http_status=404,
+        )
+
+    monkeypatch.setattr(main.stripe.Subscription, "list", _list_deleted_customer)
+    monkeypatch.setattr(main.stripe.Customer, "delete", _customer_delete)
+
+    r = client.delete("/account")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["stripe"]["already_absent"] is True
+    assert main.ddb_get_user(email) is None
+    assert delete_called == []  # list short-circuits; nothing to cancel
+
+
 # guard ----------------------------------------------------------------------
 def test_admin_cannot_self_delete_via_admin_route(client, main):
     admin = "admin@taxstat360.com"
