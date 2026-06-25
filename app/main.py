@@ -27,6 +27,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+stripe.default_http_timeout = 10  # 10s cap — prevents delete from hanging
 if not stripe.api_key:
     raise RuntimeError("STRIPE_SECRET_KEY environment variable not set")
 
