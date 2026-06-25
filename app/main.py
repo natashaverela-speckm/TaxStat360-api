@@ -464,7 +464,12 @@ def _perform_account_deletion(target_email, actor_email):
     try:
         stripe_cid = (user or {}).get("stripe_customer_id", "")
         # 1 + 2. Stripe first: a hard failure here aborts before any DB delete.
+        try:
         stripe_result = _stripe_teardown(stripe_cid)
+    except Exception as stripe_err:
+        # Stripe unavailable or misconfigured — log but do not abort deletion.
+        # The account and all data will still be removed from our systems.
+        stripe_result = {"error": str(stripe_err), "customer_deleted": False, "already_absent": True}
         # 3. DB: records first, user row last, so a retry after a partial failure
         #    is always clean (the user row stays the anchor until everything else is gone).
         records_deleted = _delete_all_user_records(target_email)
