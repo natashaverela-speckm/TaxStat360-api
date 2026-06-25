@@ -1,9 +1,39 @@
 import json, logging, os, hashlib, secrets, stripe, requests, boto3, time, hmac, bcrypt, base64, io
 from datetime import date
 from decimal import Decimal
+from logging.handlers import TimedRotatingFileHandler
 from urllib.parse import quote, unquote
 
 logger = logging.getLogger("taxstat360")
+
+
+def _configure_logging():
+    """File + stderr logging (restores pre-condense ops visibility)."""
+    if logger.handlers:
+        return
+    log_dir = os.environ.get("LOG_DIR", "/home/ubuntu/risk-planner-BE/logs")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        fh = TimedRotatingFileHandler(
+            os.path.join(log_dir, "risk_planner.log"),
+            when="midnight",
+            backupCount=14,
+            encoding="utf-8",
+        )
+        fh.suffix = "%Y%m%d"
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logger.addHandler(fh)
+    except OSError as e:
+        # Local/tests may not have the prod log path — stderr still works.
+        logging.basicConfig(level=logging.INFO)
+        logger.warning("file logging disabled: %s", e)
+    sh = logging.StreamHandler()
+    sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logger.addHandler(sh)
+    logger.setLevel(logging.INFO)
+
+
+_configure_logging()
 
 from dotenv import load_dotenv
 
@@ -29,6 +59,14 @@ from slowapi.errors import RateLimitExceeded
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 if not stripe.api_key:
     raise RuntimeError("STRIPE_SECRET_KEY environment variable not set")
+# Client-level HTTP timeout (stripe>=11: per-call timeout= is not an HTTP timeout).
+try:
+    from stripe._http_client import RequestsClient as _StripeRequestsClient
+except ImportError:  # older public layout
+    from stripe.http_client import RequestsClient as _StripeRequestsClient  # type: ignore
+
+stripe.default_http_client = _StripeRequestsClient(timeout=10)
+stripe.max_network_retries = 1
 
 MC_KEY = os.environ.get("MC_KEY", "")
 MC_LIST = "f546bd92ac"
@@ -460,11 +498,17 @@ def _perform_account_deletion(target_email, actor_email):
         raise HTTPException(400, "Target email required")
     _ensure_audit_table()
     user = ddb_get_user(target_email)  # may be None on an idempotent re-run
+    logger.info("account.delete started actor=%s target=%s", actor_email, target_email)
     _write_audit("account.delete", actor_email, target_email, "started")
     try:
         stripe_cid = (user or {}).get("stripe_customer_id", "")
         # 1 + 2. Stripe first: a hard failure here aborts before any DB delete.
         stripe_result = _stripe_teardown(stripe_cid)
+        logger.info(
+            "account.delete stripe teardown target=%s result=%s",
+            target_email,
+            stripe_result,
+        )
         # 3. DB: records first, user row last, so a retry after a partial failure
         #    is always clean (the user row stays the anchor until everything else is gone).
         records_deleted = _delete_all_user_records(target_email)
