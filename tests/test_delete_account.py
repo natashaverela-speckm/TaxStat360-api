@@ -159,6 +159,50 @@ def test_delete_when_stripe_customer_manually_removed(client, main, monkeypatch)
     assert delete_called == []  # list short-circuits; nothing to cancel
 
 
+def test_delete_cancels_subscriptions_returned_as_stripe_objects(client, main, monkeypatch):
+    """Stripe SDK returns StripeObject instances (no .get); teardown must not raise AttributeError."""
+    import stripe
+
+    email = "subowner@example.com"
+    cus = "cus_with_subs"
+    _mk_user(main, email, stripe_customer_id=cus)
+    _auth(client, main, email)
+
+    sub_active = stripe.StripeObject.construct_from(
+        {"id": "sub_active", "status": "active"}, "sk_test"
+    )
+    sub_canceled = stripe.StripeObject.construct_from(
+        {"id": "sub_old", "status": "canceled"}, "sk_test"
+    )
+
+    class _Page:
+        def auto_paging_iter(self):
+            yield sub_active
+            yield sub_canceled
+
+    canceled = []
+
+    monkeypatch.setattr(main.stripe.Subscription, "list", lambda *a, **k: _Page())
+    monkeypatch.setattr(
+        main.stripe.Subscription,
+        "cancel",
+        lambda sub_id: canceled.append(sub_id) or stripe.StripeObject.construct_from(
+            {"id": sub_id, "status": "canceled"}, "sk_test"
+        ),
+    )
+    monkeypatch.setattr(
+        main.stripe.Customer,
+        "delete",
+        lambda cid: stripe.StripeObject.construct_from({"id": cid, "deleted": True}, "sk_test"),
+    )
+
+    r = client.delete("/account")
+    assert r.status_code == 200, r.text
+    assert canceled == ["sub_active"]
+    assert r.json()["stripe"]["subscriptions_canceled"] == 1
+    assert main.ddb_get_user(email) is None
+
+
 # guard ----------------------------------------------------------------------
 def test_admin_cannot_self_delete_via_admin_route(client, main):
     admin = "admin@taxstat360.com"
