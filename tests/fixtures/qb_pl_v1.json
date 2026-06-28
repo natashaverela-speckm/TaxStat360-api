@@ -1,0 +1,75 @@
+{
+  "Header": {
+    "ReportName": "ProfitAndLoss",
+    "StartPeriod": "2025-01-01",
+    "EndPeriod": "2025-12-31"
+  },
+  "Columns": {
+    "Column": [
+      {
+        "ColTitle": "",
+        "ColType": "Account",
+        "MetaData": [{ "Name": "ColKey", "Value": "account" }]
+      },
+      {
+        "ColTitle": "Total",
+        "ColType": "Money",
+        "MetaData": [{ "Name": "ColKey", "Value": "total" }]
+      }
+    ]
+  },
+  "Rows": {
+    "Row": [
+      {
+        "type": "Section",
+        "group": "Income",
+        "Summary": {
+          "ColData": [
+            { "value": "Total Income" },
+            { "value": "150000.00" }
+          ]
+        }
+      },
+      {
+        "type": "Section",
+        "group": "COGS",
+        "Summary": {
+          "ColData": [
+            { "value": "Total Cost of Goods Sold" },
+            { "value": "40000.00" }
+          ]
+        }
+      },
+      {
+        "type": "Section",
+        "group": "Expenses",
+        "Summary": {
+          "ColData": [
+            { "value": "Total Expenses" },
+            { "value": "35000.00" }
+          ]
+        }
+      },
+      {
+        "type": "Section",
+        "group": "OtherIncome",
+        "Summary": {
+          "ColData": [
+            { "value": "Total Other Income" },
+            { "value": "5000.00" }
+          ]
+        }
+      },
+      {
+        "type": "Section",
+        "group": "NetIncome",
+        "Summary": {
+          "ColData": [
+            { "value": "Net Income" },
+            { "value": "80000.00" }
+          ]
+        }
+      }
+    ]
+  }
+}
