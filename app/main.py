@@ -1437,48 +1437,146 @@ def _parse_xero_pnl(report):
     return rev, exp, net, summaries
 
 
+def _qb_pl_column_indices(data):
+    """Map report Columns metadata to label and amount ColData indices (v1 + v2 safe)."""
+    cols = data.get("Columns", {}).get("Column", [])
+    if isinstance(cols, dict):
+        cols = [cols]
+    label_idx = None
+    amount_candidates = []
+    for i, col in enumerate(cols):
+        if not isinstance(col, dict):
+            continue
+        col_type = (col.get("ColType") or "").lower()
+        col_title = (col.get("ColTitle") or "").strip().lower()
+        col_key = ""
+        for md in col.get("MetaData") or []:
+            if isinstance(md, dict) and (md.get("Name") or "").lower() == "colkey":
+                col_key = (md.get("Value") or "").lower()
+        if col_type == "account" or col_key == "account":
+            label_idx = i
+        elif col_title in ("", "account") and label_idx is None:
+            label_idx = i
+        if col_type == "money" or col_key in ("total", "amount", "subt_nat_amount"):
+            amount_candidates.append(i)
+        elif col_title in ("total", "amount"):
+            amount_candidates.append(i)
+    if label_idx is None:
+        label_idx = 0
+    amount_idx = amount_candidates[-1] if amount_candidates else (1 if len(cols) > 1 else 0)
+    return label_idx, amount_idx
+
+
+def _qb_pl_cell(coldata, idx):
+    if not coldata or idx is None or idx < 0:
+        return {}
+    if isinstance(coldata, dict):
+        coldata = [coldata]
+    if idx >= len(coldata):
+        return {}
+    cell = coldata[idx]
+    return cell if isinstance(cell, dict) else {}
+
+
+def _qb_pl_row_label_amount(coldata, label_idx, amount_idx):
+    """Read label + amount from a Summary/Header/ColData row using column metadata."""
+    if not coldata:
+        return "", 0.0
+    if isinstance(coldata, dict):
+        coldata = [coldata]
+    label = str(_qb_pl_cell(coldata, label_idx).get("value", "") or "").strip()
+    amt = _parse_pl_amount(_qb_pl_cell(coldata, amount_idx).get("value"))
+    if amt == 0.0:
+        for cell in reversed(coldata):
+            if not isinstance(cell, dict):
+                continue
+            raw = cell.get("value")
+            if raw is None or str(raw).strip() in ("", "-"):
+                continue
+            parsed = _parse_pl_amount(raw)
+            if parsed != 0.0:
+                amt = parsed
+                break
+    return label, amt
+
+
+def _qb_normalize_group(grp):
+    return (grp or "").lower().replace(" ", "").replace("_", "")
+
+
+def _qb_pl_apply_summary(grp, name, amt, bucket):
+    """Update rev/cogs/opex/other_income/net from one Summary row."""
+    label = (name or "").lower()
+    g = _qb_normalize_group(grp)
+    if "net income" in label or "net profit" in label or g == "netincome":
+        bucket["net"] = amt
+    elif g == "income" or (
+        "total income" in label and "other" not in label
+    ) or "total for income" in label:
+        bucket["rev"] = amt
+    elif g in ("otherincome",) or (
+        "total for other income" in label
+        or ("other income" in label and "total" in label)
+    ):
+        bucket["other_income"] = amt
+    elif g in ("cogs", "costofgoodssold") or "cost of goods" in label:
+        bucket["cogs"] = abs(amt)
+    elif g == "expenses" or (
+        "total expenses" in label and "other" not in label
+    ) or "total for expenses" in label:
+        bucket["opex"] = abs(amt)
+
+
 def _parse_qb_pnl(data):
-    rev = cogs = opex = other_income = 0.0
-    net = None
+    label_idx, amount_idx = _qb_pl_column_indices(data)
+    bucket = {"rev": 0.0, "cogs": 0.0, "opex": 0.0, "other_income": 0.0, "net": None}
 
     def walk(rows):
-        nonlocal rev, cogs, opex, other_income, net
         for row in rows or []:
             if not isinstance(row, dict):
                 continue
-            grp = (row.get("group") or "").lower()
+            grp = row.get("group") or ""
             summary = row.get("Summary", {}).get("ColData", [])
-            if len(summary) >= 2:
-                name = str(summary[0].get("value", "")).lower()
-                amt = _parse_pl_amount(summary[1].get("value"))
-                if "net income" in name or "net profit" in name:
-                    net = amt
-                elif grp == "income" or (
-                    "total income" in name and "other" not in name
-                ) or "total for income" in name:
-                    rev = amt
-                elif grp in ("otherincome", "other income") or (
-                    "total for other income" in name
-                    or ("other income" in name and "total" in name)
-                ):
-                    other_income = amt
-                elif grp in ("cogs", "costofgoodssold") or "cost of goods" in name:
-                    cogs = abs(amt)
-                elif grp == "expenses" or (
-                    "total expenses" in name and "other" not in name
-                ) or "total for expenses" in name:
-                    opex = abs(amt)
+            if summary:
+                name, amt = _qb_pl_row_label_amount(summary, label_idx, amount_idx)
+                if name or amt:
+                    _qb_pl_apply_summary(grp, name, amt, bucket)
             nested = row.get("Rows", {}).get("Row", [])
             if nested:
                 walk(nested if isinstance(nested, list) else [nested])
 
     top = data.get("Rows", {}).get("Row", [])
     walk(top if isinstance(top, list) else ([top] if top else []))
-    rev += other_income
-    exp = cogs + opex
+    rev = bucket["rev"] + bucket["other_income"]
+    exp = bucket["cogs"] + bucket["opex"]
+    net = bucket["net"]
     if net is None and (rev or exp):
         net = rev - exp
     return rev, exp, net
+
+
+def _quickbooks_api_base():
+    """Production or sandbox QBO API host (sandbox companies need sandbox-quickbooks...)."""
+    return os.environ.get("QUICKBOOKS_API_BASE", "https://quickbooks.api.intuit.com").rstrip("/")
+
+
+def _quickbooks_pl_params(start, end):
+    """Query params for QuickBooks ProfitAndLoss (optional migration + minorversion)."""
+    params = {
+        "start_date": start,
+        "end_date": end,
+        "accounting_method": os.environ.get("QUICKBOOKS_ACCOUNTING_METHOD", "Cash"),
+    }
+    minor = (os.environ.get("QUICKBOOKS_MINORVERSION") or "").strip()
+    if minor:
+        params["minorversion"] = minor
+    if os.environ.get("QUICKBOOKS_TESTING_MIGRATION", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        params["testing_migration"] = ""
+    return params
 
 
 def _pnl_result(revenue, expenses, officer_salary=0, net_profit=None):
@@ -1720,12 +1818,8 @@ def integration_data(
             if not realm:
                 return {"error": "missing realm"}
             r = requests.get(
-                f"https://quickbooks.api.intuit.com/v3/company/{realm}/reports/ProfitAndLoss",
-                params={
-                    "start_date": start,
-                    "end_date": end,
-                    "accounting_method": os.environ.get("QUICKBOOKS_ACCOUNTING_METHOD", "Cash"),
-                },
+                f"{_quickbooks_api_base()}/v3/company/{realm}/reports/ProfitAndLoss",
+                params=_quickbooks_pl_params(start, end),
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
                 timeout=30,
             )
