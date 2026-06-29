@@ -45,7 +45,19 @@ def _create_tables():
         ddb.create_table(
             TableName="test-users",
             KeySchema=[{"AttributeName": "email", "KeyType": "HASH"}],
-            AttributeDefinitions=[{"AttributeName": "email", "AttributeType": "S"}],
+            AttributeDefinitions=[
+                {"AttributeName": "email", "AttributeType": "S"},
+                {"AttributeName": "stripe_customer_id", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "stripe_customer_id-index",
+                    "KeySchema": [
+                        {"AttributeName": "stripe_customer_id", "KeyType": "HASH"}
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
             BillingMode="PAY_PER_REQUEST",
         )
     if "test-records" not in existing:
