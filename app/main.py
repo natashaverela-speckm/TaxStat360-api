@@ -92,6 +92,9 @@ DB = "/home/ubuntu/risk-planner-BE/users.json"
 
 # --- M1 AUTH (DynamoDB + bcrypt + session cookie) ---
 USERS_TABLE = os.environ.get("USERS_TABLE", "taxstat360-users")
+USERS_STRIPE_CUSTOMER_GSI = os.environ.get(
+    "USERS_STRIPE_CUSTOMER_GSI", "stripe_customer_id-index"
+)
 SESSION_COOKIE = "ts360_session"
 SESSION_MAX_AGE = 7 * 24 * 3600
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-in-env")
@@ -198,6 +201,8 @@ def ddb_put_user(email, rec):
     elif "pw" in item:
         item["password_hash"] = item["pw"]
     _strip_legacy_user_fields(item)
+    if not str(item.get("stripe_customer_id") or "").strip():
+        item.pop("stripe_customer_id", None)
     _users_tbl.put_item(Item=_to_ddb(item))
 
 
@@ -231,6 +236,56 @@ def ddb_all_users():
     return out
 
 
+def _ddb_user_from_item(item):
+    item = _from_ddb(item)
+    em = item.get("email")
+    if not em:
+        return None, None
+    pw = _resolve_stored_password(item)
+    if pw:
+        item["pw"] = pw
+    return em, item
+
+
+def ddb_find_user_by_stripe_customer_id(stripe_customer_id):
+    """O(1) lookup via GSI; scan fallback only when the index is not deployed yet."""
+    from botocore.exceptions import ClientError
+
+    cid = (stripe_customer_id or "").strip()
+    if not cid:
+        return None, None
+    if USERS_STRIPE_CUSTOMER_GSI:
+        try:
+            resp = _users_tbl.query(
+                IndexName=USERS_STRIPE_CUSTOMER_GSI,
+                KeyConditionExpression=Key("stripe_customer_id").eq(cid),
+                Limit=1,
+            )
+            items = resp.get("Items") or []
+            if items:
+                return _ddb_user_from_item(items[0])
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code not in ("ValidationException", "ResourceNotFoundException"):
+                logger.warning("stripe customer GSI query failed: %s", e)
+                raise
+            logger.warning(
+                "stripe customer GSI %s unavailable (%s); using filtered scan",
+                USERS_STRIPE_CUSTOMER_GSI,
+                code,
+            )
+    from boto3.dynamodb.conditions import Attr
+
+    resp = _users_tbl.scan(
+        FilterExpression=Attr("stripe_customer_id").eq(cid),
+        Limit=1,
+    )
+    items = resp.get("Items") or []
+    if items:
+        return _ddb_user_from_item(items[0])
+    return None, None
+
+
 def load():
     users = ddb_all_users()
     if users:
@@ -248,12 +303,17 @@ def save(u):
 
 def _ddb_update_user_plan(stripe_customer_id, plan):
     """Update one user's plan without re-writing every account (avoids password clobber)."""
-    for email, ud in ddb_all_users().items():
-        if ud.get("stripe_customer_id") == stripe_customer_id:
-            ud["plan"] = plan
-            ddb_put_user(email, ud)
-            return email
-    return None
+    email, ud = ddb_find_user_by_stripe_customer_id(stripe_customer_id)
+    if not email or not ud:
+        logger.warning(
+            "stripe plan update: no user for customer %s (plan=%s)",
+            stripe_customer_id,
+            plan,
+        )
+        return None
+    ud["plan"] = plan
+    ddb_put_user(email, ud)
+    return email
 
 
 def _make_session(email):
@@ -1984,9 +2044,6 @@ async def aria_chat(request: Request):
     return {"reply": reply}
 
 
-WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-
-
 @app.get("/auth/verify-email")
 def verify_email(token: str = "", email: str = ""):
     email = _norm_email(email)
@@ -2069,6 +2126,33 @@ def reset_password(r: ResetReq, request: Request):
     return {"ok": True}
 
 
+WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+
+
+def _process_stripe_webhook_event(event):
+    """Apply subscription/plan side effects for a verified Stripe event."""
+    etype = event.get("type", "")
+    data = event.get("data", {}).get("object", {})
+    cid = data.get("customer", "")
+    if etype == "customer.subscription.updated":
+        status = data.get("status", "")
+        items = data.get("items", {}).get("data", [])
+        price_id = items[0].get("price", {}).get("id", "") if items else ""
+        new_plan = next((k for k, v in PRICE_IDS.items() if price_id in v.values()), None)
+        if status in ("active", "trialing") and new_plan:
+            _ddb_update_user_plan(cid, new_plan)
+        elif status in ("canceled", "unpaid", "past_due"):
+            _ddb_update_user_plan(cid, "starter")
+    elif etype == "customer.subscription.deleted":
+        _ddb_update_user_plan(cid, "starter")
+    elif etype == "invoice.payment_failed":
+        email, _ = ddb_find_user_by_stripe_customer_id(cid)
+        if email:
+            logger.warning("invoice.payment_failed for %s (stripe %s)", email, cid)
+        else:
+            logger.warning("invoice.payment_failed for unknown stripe customer %s", cid)
+
+
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
     payload = await request.body()
@@ -2089,23 +2173,12 @@ async def stripe_webhook(request: Request):
     except Exception as e:
         logger.exception("stripe webhook unexpected error")
         raise HTTPException(400, "Invalid webhook payload")
-    etype = event.get("type", "")
-    data = event.get("data", {}).get("object", {})
-    cid = data.get("customer", "")
-    if etype == "customer.subscription.updated":
-        status = data.get("status", "")
-        items = data.get("items", {}).get("data", [])
-        price_id = items[0].get("price", {}).get("id", "") if items else ""
-        new_plan = next((k for k, v in PRICE_IDS.items() if price_id in v.values()), None)
-        if status in ("active", "trialing") and new_plan:
-            _ddb_update_user_plan(cid, new_plan)
-        elif status in ("canceled", "unpaid", "past_due"):
-            _ddb_update_user_plan(cid, "starter")
-    elif etype == "customer.subscription.deleted":
-        _ddb_update_user_plan(cid, "starter")
-    elif etype == "invoice.payment_failed":
-        for em, ud in ddb_all_users().items():
-            if ud.get("stripe_customer_id") == cid:
-                logger.warning("invoice.payment_failed for stripe customer %s", cid)
-                break
+    try:
+        _process_stripe_webhook_event(event)
+    except Exception:
+        logger.exception(
+            "stripe webhook processing failed type=%s id=%s",
+            event.get("type", ""),
+            event.get("id", ""),
+        )
     return {"status": "ok"}
