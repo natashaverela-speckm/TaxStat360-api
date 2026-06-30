@@ -28,6 +28,7 @@ os.environ.update(
         "AWS_SESSION_TOKEN": "testing",
         "AWS_DEFAULT_REGION": "us-east-1",
         "LOG_DIR": "/tmp/taxstat360-test-logs",
+        "SESSION_COOKIE_DOMAIN": "",
     }
 )
 
