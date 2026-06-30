@@ -98,6 +98,8 @@ USERS_STRIPE_CUSTOMER_GSI = os.environ.get(
 SESSION_COOKIE = "ts360_session"
 SESSION_MAX_AGE = 7 * 24 * 3600
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-in-env")
+# Share session cookie across www/app subdomains; empty in tests/local.
+SESSION_COOKIE_DOMAIN = os.environ.get("SESSION_COOKIE_DOMAIN", ".taxstat360.com")
 
 _ddb = boto3.resource("dynamodb", region_name="us-east-1")
 _users_tbl = _ddb.Table(USERS_TABLE)
@@ -342,23 +344,36 @@ def _verify_session(token):
 
 
 def _session_email(request):
-    return _verify_session(request.cookies.get(SESSION_COOKIE, ""))
+    email = _verify_session(request.cookies.get(SESSION_COOKIE, ""))
+    if email:
+        return email
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return _verify_session(auth[7:].strip())
+    return None
 
 
-def _set_session_cookie(response, email):
-    response.set_cookie(
-        key=SESSION_COOKIE,
-        value=_make_session(email),
-        max_age=SESSION_MAX_AGE,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/",
-    )
+def _set_session_cookie(response, email, session_value=None):
+    val = session_value or _make_session(email)
+    kwargs = {
+        "key": SESSION_COOKIE,
+        "value": val,
+        "max_age": SESSION_MAX_AGE,
+        "httponly": True,
+        "secure": True,
+        "samesite": "none",
+        "path": "/",
+    }
+    if SESSION_COOKIE_DOMAIN:
+        kwargs["domain"] = SESSION_COOKIE_DOMAIN
+    response.set_cookie(**kwargs)
 
 
 def _clear_session_cookie(response):
-    response.delete_cookie(key=SESSION_COOKIE, path="/")
+    kwargs = {"key": SESSION_COOKIE, "path": "/"}
+    if SESSION_COOKIE_DOMAIN:
+        kwargs["domain"] = SESSION_COOKIE_DOMAIN
+    response.delete_cookie(**kwargs)
 
 
 def _user_public(rec, email):
@@ -740,8 +755,14 @@ def _complete_login(email, x):
     x.pop("mfa_login_exp", None)
     ddb_put_user(email, x)
     plan = x.get("plan", "starter")
-    resp = JSONResponse({"ok": True, "plan": plan, "email": email})
-    _set_session_cookie(resp, email)
+    session_token = _make_session(email)
+    resp = JSONResponse({
+        "ok": True,
+        "plan": plan,
+        "email": email,
+        "access_token": session_token,
+    })
+    _set_session_cookie(resp, email, session_token)
     return resp
 
 
@@ -898,8 +919,14 @@ def register(r: Reg, request: Request):
         _send_verification_email(email, verify_tok)
     except Exception as e:
         logger.warning("SES verify error: %s", e)
-    resp = JSONResponse({"ok": True, "plan": plan, "email": email})
-    _set_session_cookie(resp, email)
+    session_token = _make_session(email)
+    resp = JSONResponse({
+        "ok": True,
+        "plan": plan,
+        "email": email,
+        "access_token": session_token,
+    })
+    _set_session_cookie(resp, email, session_token)
     return resp
 
 
