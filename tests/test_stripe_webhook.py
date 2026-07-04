@@ -60,6 +60,66 @@ def test_subscription_deleted_downgrades_to_starter(client, main, monkeypatch):
     assert main.ddb_get_user("gone@example.com")["plan"] == "starter"
 
 
+def test_webhook_with_secret_processes_payload_not_stripe_object(client, main, monkeypatch):
+    """With a webhook secret set, we must process the plain-dict payload, not the
+    StripeObject from construct_event (whose .get() raises AttributeError)."""
+    monkeypatch.setattr(main, "WEBHOOK_SECRET", "whsec_test")
+
+    class _GetHostile:
+        # Mimics stripe StripeObject: attribute access for "get" raises.
+        def get(self, *a, **k):
+            raise AttributeError("get")
+
+    monkeypatch.setattr(
+        main.stripe.Webhook, "construct_event", lambda *a, **k: _GetHostile()
+    )
+    _mk_user(main, "sec@example.com", stripe_customer_id="cus_sec", plan="enterprise")
+    event = _webhook_event("customer.subscription.deleted", "cus_sec")
+    r = client.post(
+        "/stripe/webhook",
+        content=json.dumps(event),
+        headers={"Stripe-Signature": "t=1,v1=deadbeef"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+    assert main.ddb_get_user("sec@example.com")["plan"] == "starter"
+
+
+def test_webhook_bad_signature_returns_400(client, main, monkeypatch):
+    monkeypatch.setattr(main, "WEBHOOK_SECRET", "whsec_test")
+
+    def _raise(*a, **k):
+        raise main.stripe.error.SignatureVerificationError("bad", "sig")
+
+    monkeypatch.setattr(main.stripe.Webhook, "construct_event", _raise)
+    event = _webhook_event("customer.subscription.deleted", "cus_x")
+    r = client.post(
+        "/stripe/webhook",
+        content=json.dumps(event),
+        headers={"Stripe-Signature": "t=1,v1=bad"},
+    )
+    assert r.status_code == 400
+
+
+def test_subscription_deleted_missing_user_returns_200(client, main, monkeypatch):
+    """Cancellation after the account was already deleted must not 500."""
+    monkeypatch.setattr(main, "WEBHOOK_SECRET", "")
+    # No user with this customer id exists (record already removed).
+    event = _webhook_event("customer.subscription.deleted", "cus_ghost")
+    r = client.post("/stripe/webhook", content=json.dumps(event))
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
+def test_subscription_deleted_null_data_object_returns_200(client, main, monkeypatch):
+    """A malformed cancellation payload (null data/object) must not 500."""
+    monkeypatch.setattr(main, "WEBHOOK_SECRET", "")
+    event = {"id": "evt_null", "type": "customer.subscription.deleted", "data": None}
+    r = client.post("/stripe/webhook", content=json.dumps(event))
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
 def test_processing_failure_still_returns_200(client, main, monkeypatch):
     monkeypatch.setattr(main, "WEBHOOK_SECRET", "")
     _mk_user(main, "fail@example.com", stripe_customer_id="cus_webhook_3")
