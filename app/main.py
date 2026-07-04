@@ -2157,21 +2157,41 @@ WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
 
 def _process_stripe_webhook_event(event):
-    """Apply subscription/plan side effects for a verified Stripe event."""
+    """Apply subscription/plan side effects for a verified Stripe event.
+
+    Defensive against partial / None payloads. A cancellation
+    (customer.subscription.deleted) can arrive AFTER the user's DynamoDB
+    record was already removed (e.g. account deletion), and some nested
+    fields (cancellation_details, items) can be null. Every branch tolerates
+    a missing user / missing field, logs, and returns without raising so a
+    single event can never 500 and get the endpoint disabled again.
+    """
     etype = event.get("type", "")
-    data = event.get("data", {}).get("object", {})
-    cid = data.get("customer", "")
+    data = (event.get("data") or {}).get("object") or {}
+    cid = data.get("customer", "") or ""
     if etype == "customer.subscription.updated":
         status = data.get("status", "")
-        items = data.get("items", {}).get("data", [])
-        price_id = items[0].get("price", {}).get("id", "") if items else ""
+        items = (data.get("items") or {}).get("data") or []
+        price_id = (items[0].get("price") or {}).get("id", "") if items else ""
         new_plan = next((k for k, v in PRICE_IDS.items() if price_id in v.values()), None)
         if status in ("active", "trialing") and new_plan:
             _ddb_update_user_plan(cid, new_plan)
         elif status in ("canceled", "unpaid", "past_due"):
             _ddb_update_user_plan(cid, "starter")
     elif etype == "customer.subscription.deleted":
-        _ddb_update_user_plan(cid, "starter")
+        if not cid:
+            logger.info(
+                "subscription.deleted with no customer id; nothing to update (event=%s)",
+                event.get("id", ""),
+            )
+            return
+        updated = _ddb_update_user_plan(cid, "starter")
+        if not updated:
+            logger.info(
+                "subscription.deleted for already-removed/missing user "
+                "(customer=%s); nothing to update",
+                cid,
+            )
     elif etype == "invoice.payment_failed":
         email, _ = ddb_find_user_by_stripe_customer_id(cid)
         if email:
@@ -2188,24 +2208,30 @@ async def stripe_webhook(request: Request):
 
     try:
         if WEBHOOK_SECRET:
-            event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
-        else:
-            event = _json.loads(payload)
+            # Verify the signature (raises on tampering / mismatch). We deliberately
+            # do NOT use its return value for processing: stripe.Webhook.construct_event
+            # returns a StripeObject whose .get() routes through __getattr__ and raises
+            # AttributeError on this stripe version. Process a plain dict instead.
+            stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
+        event = _json.loads(payload)
     except stripe.error.SignatureVerificationError:
         logger.warning("stripe webhook signature verification failed")
         raise HTTPException(400, "Invalid webhook signature")
     except (ValueError, TypeError) as e:
         logger.warning("stripe webhook payload invalid: %s", e)
         raise HTTPException(400, "Invalid webhook payload")
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception:
         logger.exception("stripe webhook unexpected error")
         raise HTTPException(400, "Invalid webhook payload")
+    # event is now a plain dict, so .get() is always safe here and below.
     try:
         _process_stripe_webhook_event(event)
     except Exception:
         logger.exception(
             "stripe webhook processing failed type=%s id=%s",
-            event.get("type", ""),
-            event.get("id", ""),
+            event.get("type", "") if isinstance(event, dict) else "",
+            event.get("id", "") if isinstance(event, dict) else "",
         )
     return {"status": "ok"}
