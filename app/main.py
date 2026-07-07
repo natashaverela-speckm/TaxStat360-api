@@ -386,6 +386,60 @@ def _user_public(rec, email):
     }
 
 
+# --- OBS-5 FORM-KEY RELAY (Phase 2.2c, Jul 2026) ------------------------------
+# Implements the spec written in the frontend's KNOWN_LIMITATIONS.md (Batch 6):
+# the web3forms access key previously shipped inside the served JS bundle —
+# extractable by anyone, spam-risk only (the key submits, it cannot read).
+# The key now lives ONLY here (env WEB3FORMS_ACCESS_KEY); the frontend posts
+# its form fields to this relay, which attaches the key server-side and
+# forwards. CORS is already restricted to taxstat360.com origins app-wide;
+# rate limit per spec (5/min/IP); fields are whitelisted and length-capped so
+# the relay cannot be used as a generic proxy.
+WEB3FORMS_ACCESS_KEY = os.environ.get("WEB3FORMS_ACCESS_KEY", "")
+_FORM_RELAY_FIELDS = ("subject", "email", "message", "from_name", "plan", "billing", "status", "detail")
+_FORM_RELAY_MAX_LEN = 4000
+
+
+@app.post("/alerts/form-relay")
+@limiter.limit("5/minute")
+async def form_relay(request: Request):
+    if not WEB3FORMS_ACCESS_KEY:
+        # Loud misconfiguration: a deploy without the env var must not silently
+        # drop owner alerts (the D-03 signup-failure alerts route through here).
+        logger.error("form-relay called but WEB3FORMS_ACCESS_KEY is not set")
+        raise HTTPException(503, "Alert relay is not configured")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "JSON body required")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "JSON object required")
+    payload = {"access_key": WEB3FORMS_ACCESS_KEY}
+    for k in _FORM_RELAY_FIELDS:
+        v = body.get(k)
+        if v is None:
+            continue
+        payload[k] = str(v)[:_FORM_RELAY_MAX_LEN]
+    if not payload.get("subject"):
+        raise HTTPException(400, "subject is required")
+    try:
+        r = requests.post(
+            "https://api.web3forms.com/submit",
+            json=payload,
+            headers={"Accept": "application/json"},
+            timeout=10,   # the Stripe-hang lesson (5e93ad9): every outbound call carries a timeout
+        )
+        ok = False
+        try:
+            ok = bool(r.json().get("success"))
+        except Exception:
+            ok = r.ok
+        return {"success": ok}
+    except requests.RequestException as e:
+        logger.warning("form-relay upstream failure: %s", e)
+        raise HTTPException(502, "Alert relay upstream unavailable")
+
+
 # --- M2 RECORDS (DynamoDB sync) ---
 RECORDS_TABLE = os.environ.get("RECORDS_TABLE", "taxstat360-records")
 _records_tbl = _ddb.Table(RECORDS_TABLE)
