@@ -1136,9 +1136,32 @@ def biz(user=Depends(get_user_from_token)):
     return {"status": "saved"}
 
 
+def _check_expected_user(user_id, expected):
+    """PHASE 2.2 IDENTITY GUARD (D-1 countermeasure, Jul 2026).
+
+    The July 3 "destroyed siblings" incident was a session identity flip: the
+    browser's effective session switched accounts mid-operation (staged
+    cookie-Domain change + two logins on one machine), so writes landed in —
+    and reads returned — a different userId partition. Nothing was deleted;
+    everything was mis-filed and "vanished" from view. The client now pins
+    which account it BELIEVES each records request is for (X-Expected-User
+    header on GET/DELETE, expectedUser field on PUT); a mismatch fails loudly
+    here with a 409 instead of mis-filing silently. Absent pin ⇒ no check
+    (older clients keep working)."""
+    if expected is None or str(expected).strip() == "":
+        return
+    if _norm_email(str(expected)) != user_id:
+        raise HTTPException(
+            409,
+            "Session/account mismatch: this browser is signed in as a different "
+            "account than this page expects. Reload the page and sign in again.",
+        )
+
+
 @app.get("/records")
 def list_records(request: Request):
     user_id = _require_session_user(request)
+    _check_expected_user(user_id, request.headers.get("x-expected-user"))
     items = _ddb_query_records(user_id)
     out = [_record_from_item(it) for it in items]
     out.sort(key=lambda r: r.get("updatedAt", r.get("id", 0)), reverse=True)
@@ -1151,6 +1174,9 @@ async def upsert_record(request: Request):
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(400, "Record must be a JSON object")
+    # Identity guard — see _check_expected_user. Popped so the pin is transport
+    # metadata, never persisted (writtenBySession/-Ip remain the forensics).
+    _check_expected_user(user_id, body.pop("expectedUser", None))
     record_id = body.get("id")
     if record_id is None:
         raise HTTPException(400, "Record id is required")
@@ -1181,6 +1207,7 @@ async def upsert_record(request: Request):
 @app.delete("/records/{record_id}")
 def delete_record(record_id: int, request: Request):
     user_id = _require_session_user(request)
+    _check_expected_user(user_id, request.headers.get("x-expected-user"))
     existing = _records_tbl.get_item(Key={"userId": user_id, "recordId": record_id}).get("Item")
     if not existing:
         raise HTTPException(404, "Record not found")
