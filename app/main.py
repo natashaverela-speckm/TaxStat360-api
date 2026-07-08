@@ -1212,6 +1212,11 @@ def _check_expected_user(user_id, expected):
     if expected is None or str(expected).strip() == "":
         return
     if _norm_email(str(expected)) != user_id:
+        # PHASE 4 (audit-trail gap found by the Jul-8 forensics drill): an
+        # identity mismatch is the exact signature of the D-1 incident class —
+        # it deserves a permanent audit row, not just a 409 in an access log.
+        _write_audit("identity.mismatch", user_id, _norm_email(str(expected)),
+                     "blocked", "expectedUser pin did not match session")
         raise HTTPException(
             409,
             "Session/account mismatch: this browser is signed in as a different "
@@ -1271,8 +1276,15 @@ def delete_record(record_id: int, request: Request):
     _check_expected_user(user_id, request.headers.get("x-expected-user"))
     existing = _records_tbl.get_item(Key={"userId": user_id, "recordId": record_id}).get("Item")
     if not existing:
+        _write_audit("record.delete", user_id, user_id, "not_found", f"recordId={record_id}")
         raise HTTPException(404, "Record not found")
     _records_tbl.delete_item(Key={"userId": user_id, "recordId": record_id})
+    # PHASE 4 (Jul-8 drill): record deletions previously left NO audit entry —
+    # only account deletions did — so a "where did my records go?" question
+    # cost an hour of forensics instead of one table lookup. The record's name
+    # rides in `detail` so the audit row alone answers "what was deleted".
+    _write_audit("record.delete", user_id, user_id, "completed",
+                 f"recordId={record_id}; name={str(existing.get('name') or '')[:120]}")
     return {"ok": True}
 
 
