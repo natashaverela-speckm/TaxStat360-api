@@ -386,16 +386,23 @@ def _user_public(rec, email):
     }
 
 
-# --- OBS-5 FORM-KEY RELAY (Phase 2.2c, Jul 2026) ------------------------------
-# Implements the spec written in the frontend's KNOWN_LIMITATIONS.md (Batch 6):
-# the web3forms access key previously shipped inside the served JS bundle —
-# extractable by anyone, spam-risk only (the key submits, it cannot read).
-# The key now lives ONLY here (env WEB3FORMS_ACCESS_KEY); the frontend posts
-# its form fields to this relay, which attaches the key server-side and
-# forwards. CORS is already restricted to taxstat360.com origins app-wide;
-# rate limit per spec (5/min/IP); fields are whitelisted and length-capped so
-# the relay cannot be used as a generic proxy.
-WEB3FORMS_ACCESS_KEY = os.environ.get("WEB3FORMS_ACCESS_KEY", "")
+# --- OBS-5 ALERT RELAY (Phase 2.2c, revised 2.2c-r1, Jul 2026) -----------------
+# HISTORY: the first 2.2c relay forwarded to web3forms with a server-held key,
+# per the Batch-6 spec. Live testing revealed web3forms REJECTS server-side
+# submissions on the free plan ("Use our API in client side ... Pro plan is
+# required") — and the relay's original error handling passed that rejection
+# through as HTTP 200 {"success": false}, a silent failure. Both problems die
+# here: the relay now sends the email ITSELF via SES (the same transport the
+# password-reset and verification emails already use, from the same verified
+# sender), so there is no third party, no key anywhere, and no plan
+# restriction; and any send failure is a loud 502, never a quiet false.
+# Field whitelist, caps, subject requirement, and the 5/min/IP limit are
+# unchanged from the spec. The D-03 signup-failure alerts and the Landing
+# contact form route through here; Reply-To carries the submitter's address
+# so the owner can reply directly from the inbox.
+# Destination override via env; default matches ADMIN_EMAILS' default (which is
+# defined later in this module — do not reference it here at import time).
+ALERT_TO_EMAIL = os.environ.get("ALERT_TO_EMAIL", "support@taxstat360.com")
 _FORM_RELAY_FIELDS = ("subject", "email", "message", "from_name", "plan", "billing", "status", "detail")
 _FORM_RELAY_MAX_LEN = 4000
 
@@ -403,41 +410,41 @@ _FORM_RELAY_MAX_LEN = 4000
 @app.post("/alerts/form-relay")
 @limiter.limit("5/minute")
 async def form_relay(request: Request):
-    if not WEB3FORMS_ACCESS_KEY:
-        # Loud misconfiguration: a deploy without the env var must not silently
-        # drop owner alerts (the D-03 signup-failure alerts route through here).
-        logger.error("form-relay called but WEB3FORMS_ACCESS_KEY is not set")
-        raise HTTPException(503, "Alert relay is not configured")
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(400, "JSON body required")
     if not isinstance(body, dict):
         raise HTTPException(400, "JSON object required")
-    payload = {"access_key": WEB3FORMS_ACCESS_KEY}
+    fields = {}
     for k in _FORM_RELAY_FIELDS:
         v = body.get(k)
         if v is None:
             continue
-        payload[k] = str(v)[:_FORM_RELAY_MAX_LEN]
-    if not payload.get("subject"):
+        fields[k] = str(v)[:_FORM_RELAY_MAX_LEN]
+    if not fields.get("subject"):
         raise HTTPException(400, "subject is required")
+    lines = [f"{k}: {fields[k]}" for k in _FORM_RELAY_FIELDS if k in fields and k != "subject"]
+    text_body = "\n\n".join(lines) if lines else "(no fields provided)"
+    reply_to = fields.get("email", "").strip()
     try:
-        r = requests.post(
-            "https://api.web3forms.com/submit",
-            json=payload,
-            headers={"Accept": "application/json"},
-            timeout=10,   # the Stripe-hang lesson (5e93ad9): every outbound call carries a timeout
-        )
-        ok = False
-        try:
-            ok = bool(r.json().get("success"))
-        except Exception:
-            ok = r.ok
-        return {"success": ok}
-    except requests.RequestException as e:
-        logger.warning("form-relay upstream failure: %s", e)
-        raise HTTPException(502, "Alert relay upstream unavailable")
+        ses = boto3.client("ses", region_name="us-east-1")
+        kwargs = {
+            "Source": RESET_FROM,
+            "Destination": {"ToAddresses": [ALERT_TO_EMAIL]},
+            "Message": {
+                "Subject": {"Data": fields["subject"][:998]},
+                "Body": {"Text": {"Data": text_body}},
+            },
+        }
+        if reply_to and "@" in reply_to:
+            kwargs["ReplyToAddresses"] = [reply_to]
+        ses.send_email(**kwargs)
+        return {"success": True}
+    except Exception as e:
+        # LOUD failure — an owner alert that cannot send must never pretend it did.
+        logger.error("form-relay SES send failed: %s", e)
+        raise HTTPException(502, "Alert delivery unavailable")
 
 
 # --- M2 RECORDS (DynamoDB sync) ---
