@@ -1,5 +1,8 @@
 import json, logging, os, hashlib, secrets, stripe, requests, boto3, time, hmac, bcrypt, base64, io
-from datetime import date
+# AUDIT F-8c: datetime/timezone/timedelta are needed by _send_trial_confirmation_email()
+# to compute the trial-end date. Only `date` was imported; using the others without this
+# line raises NameError on every signup.
+from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
 from logging.handlers import TimedRotatingFileHandler
 from urllib.parse import quote, unquote
@@ -878,6 +881,11 @@ class Reg(BaseModel):
     email: str
     password: str
     plan: str = "starter"
+    # AUDIT F-8c (Jul 2026): the auto-renewal acknowledgment must state the AMOUNT and
+    # CADENCE the customer actually agreed to. The signup page already knows whether they
+    # chose monthly or annual; it simply never sent it. Defaults to "monthly" so an older
+    # client that omits the field still produces a correct (conservative) email.
+    billing: str = "monthly"
     payment_method_id: str = ""
 
 
@@ -955,6 +963,90 @@ def _send_verification_email(email, verify_tok):
     )
 
 
+# ---------------------------------------------------------------------------------
+# AUDIT F-8c (Jul 2026) - AUTO-RENEWAL ACKNOWLEDGMENT.
+#
+# The only email sent at signup was "Confirm your email" - a bare token link with no
+# billing information in it at all. That is an identity check, not a renewal
+# acknowledgment. They are different documents with different jobs.
+#
+# California's Automatic Renewal Law and the FTC negative-option rule expect the renewal
+# terms in a record the customer can RETAIN, stating: (1) that it renews automatically,
+# (2) the amount, (3) the frequency, (4) the date of the first charge, and (5) how to
+# cancel. The verification email carried none of the five.
+#
+# WORDING IS DELIBERATELY IDENTICAL to the signup page (frontend constants.js ->
+# renewalDisclosure()) and to Terms of Service section 3. Three copies of a promise that
+# can drift is exactly how "Cancel in one click" ended up live on a site where
+# cancelling took two clicks. If you change one, change all three.
+# ---------------------------------------------------------------------------------
+
+TRIAL_DAYS = 7
+
+# Must stay in lockstep with frontend src/constants.js (PLAN_PRICING).
+# annual_total = monthly * 10  ("two months free").
+PLAN_PRICES = {
+    "starter":      {"monthly": 79,  "annual_total": 790,  "label": "Starter"},
+    "professional": {"monthly": 149, "annual_total": 1490, "label": "Professional"},
+    "enterprise":   {"monthly": 299, "annual_total": 2990, "label": "Enterprise"},
+}
+
+
+def _send_trial_confirmation_email(email, name, plan, billing):
+    p = PLAN_PRICES.get(plan, PLAN_PRICES["starter"])
+    is_annual = (billing or "monthly").lower() == "annual"
+    amount = "$" + format(p["annual_total"] if is_annual else p["monthly"], ",")
+    cadence = "every 12 months" if is_annual else "every month"
+    end_date = (datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)).strftime("%B %d, %Y").replace(" 0", " ")
+    greeting = "Hi " + name + "," if name else "Hi,"
+
+    html = (
+        '<div style="font-family:-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:32px 24px">'
+        '<div style="font-weight:800;font-size:20px;color:#0D1B3E;margin-bottom:20px">'
+        'TaxStat<span style="color:#2563EB">360</span></div>'
+        f'<p style="font-size:15px;color:#0D1B3E">{greeting}</p>'
+        f'<p style="font-size:15px;line-height:1.6;color:#334155">Your {TRIAL_DAYS}-day free trial of '
+        f'<strong>TaxStat360 {p["label"]}</strong> is active. Here are your billing terms, in '
+        'writing, so you have them.</p>'
+        '<div style="background:#FFFBEB;border:1px solid #FCD34D;border-radius:10px;padding:16px;margin:18px 0">'
+        '<p style="margin:0 0 10px;font-weight:700;font-size:15px;color:#92400E">'
+        'Your subscription renews automatically.</p>'
+        f'<p style="margin:0;font-size:14px;line-height:1.7;color:#92400E">'
+        f'Trial ends: <strong>{end_date}</strong><br>'
+        f'You will be charged: <strong>{amount} on {end_date}</strong><br>'
+        f'Then: <strong>{amount} {cadence}</strong>, automatically, until you cancel.</p>'
+        '<p style="margin:10px 0 0;font-size:13px;color:#92400E">You have not been charged anything yet.</p>'
+        '</div>'
+        '<p style="font-weight:700;font-size:15px;color:#0D1B3E;margin-bottom:6px">How to cancel</p>'
+        f'<p style="font-size:14px;line-height:1.6;color:#334155">Sign in and go to '
+        '<strong>Settings &rarr; Manage Billing</strong>. If you cancel before '
+        f'<strong>{end_date}</strong>, <strong>you will not be charged at all</strong>. If you '
+        'cancel after a billing period has begun, your access continues to the end of that '
+        'period and you are not charged again.</p>'
+        '<p style="margin:20px 0"><a href="https://www.taxstat360.com/settings" '
+        'style="background:#0D1B3E;color:#fff;padding:12px 22px;border-radius:8px;'
+        'text-decoration:none;display:inline-block;font-weight:700;font-size:14px">'
+        'Manage or cancel your subscription</a></p>'
+        '<p style="font-size:12px;color:#64748B;line-height:1.6">No refunds are given for billing '
+        'periods already charged, including annual plans. Cancelling stops future renewals; it '
+        'does not refund the current period.</p>'
+        '<p style="font-size:12px;color:#64748B;line-height:1.6">Questions: '
+        '<a href="mailto:support@taxstat360.com" style="color:#2563EB">support@taxstat360.com</a><br>'
+        'Full terms: <a href="https://www.taxstat360.com/terms" style="color:#2563EB">'
+        'taxstat360.com/terms</a></p>'
+        '</div>'
+    )
+    ses = boto3.client("ses", region_name="us-east-1")
+    ses.send_email(
+        Source=RESET_FROM,
+        Destination={"ToAddresses": [email]},
+        Message={
+            "Subject": {"Data": "Your TaxStat360 trial has started - what happens on " + end_date},
+            "Body": {"Html": {"Data": html}},
+        },
+    )
+
+
 @app.post("/auth/register")
 @limiter.limit("3/minute")
 def register(r: Reg, request: Request):
@@ -980,6 +1072,13 @@ def register(r: Reg, request: Request):
         _send_verification_email(email, verify_tok)
     except Exception as e:
         logger.warning("SES verify error: %s", e)
+    # AUDIT F-8c: the auto-renewal acknowledgment. Non-fatal by design - a failed email
+    # must never roll back a successful signup - but logged at ERROR, not WARNING, because
+    # a silently-missing acknowledgment IS the compliance gap this closes.
+    try:
+        _send_trial_confirmation_email(email, r.name, plan, r.billing)
+    except Exception as e:
+        logger.error("TRIAL_CONFIRMATION_EMAIL_FAILED email=%s error=%s", email, e)
     session_token = _make_session(email)
     resp = JSONResponse({
         "ok": True,
