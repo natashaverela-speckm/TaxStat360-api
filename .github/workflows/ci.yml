@@ -38,5 +38,8 @@ jobs:
 
       # moto mocks DynamoDB and conftest.py sets the env vars app.main reads at
       # import, so no AWS credentials or live services are needed.
+      # `python -m pytest` (NOT bare `pytest`): the module form puts the repo root on
+      # sys.path, which tests/conftest.py needs for `import app.main`. The bare console
+      # script does not, and collection dies with ModuleNotFoundError -> exit code 2.
       - name: Run tests
-        run: pytest -q
+        run: python -m pytest -q
