@@ -29,9 +29,11 @@ class _FakeSES:
 
 
 def _patch_ses(main, monkeypatch, fake):
-    real_client = main.boto3.client
-    monkeypatch.setattr(main.boto3, "client",
-                        lambda svc, **kw: fake if svc == "ses" else real_client(svc, **kw))
+    # The mailer was migrated from boto3 SES to _SendGridMailer (see _mailer()); patching
+    # boto3.client no longer intercepts delivery, so these tests were silently exercising
+    # the real SendGrid path and 502-ing without a key. Patch the single mailer seam
+    # instead — the endpoint builds SES-style kwargs that _FakeSES records unchanged.
+    monkeypatch.setattr(main, "_mailer", lambda: fake)
     return fake
 
 
