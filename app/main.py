@@ -431,7 +431,7 @@ async def form_relay(request: Request):
     text_body = "\n\n".join(lines) if lines else "(no fields provided)"
     reply_to = fields.get("email", "").strip()
     try:
-        ses = boto3.client("ses", region_name="us-east-1")
+        ses = _mailer()   # AUDIT F-8d: SendGrid, not SES (SES sandbox drops all customer mail)
         kwargs = {
             "Source": RESET_FROM,
             "Destination": {"ToAddresses": [ALERT_TO_EMAIL]},
@@ -912,6 +912,83 @@ ALLOWED_PROVIDERS = {"quickbooks", "freshbooks", "xero", "wave"}
 
 FRONTEND_URL = "https://www.taxstat360.com"
 RESET_FROM = "noreply@taxstat360.com"
+
+# ---------------------------------------------------------------------------------
+# AUDIT F-8d (Jul 2026) - EMAIL DELIVERY MOVED FROM AWS SES TO SENDGRID.
+#
+# WHY. Our AWS SES account is in the SANDBOX, which silently discards every message to
+# an address that has not been individually verified in the AWS console. Only four
+# addresses were verified, so in practice NO customer could ever receive ANY email:
+# not the verification link (so they could never activate), not the billing
+# acknowledgment, not a password reset (so they could never get back in). Nothing
+# bounced and nothing errored - AWS simply dropped them. We requested production
+# access and AWS Trust and Safety declined without stating a reason.
+#
+# SendGrid is already paid for (Essentials, 50k/month) and taxstat360.com is already
+# domain-authenticated there, so it can send to anyone today.
+#
+# HOW. _SendGridMailer is a drop-in stand-in for the boto3 SES client, accepting the
+# exact same send_email(**kwargs) shape this file already uses. That is deliberate:
+# every existing call site stays byte-for-byte unchanged, so this swap cannot alter
+# any email's content - only the pipe it travels down.
+#
+# REQUIRES: SENDGRID_API_KEY in /etc/environment on the API host (systemd reads it via
+# EnvironmentFile). Without it, sends raise and are caught by the callers' try/except.
+# ---------------------------------------------------------------------------------
+
+SENDGRID_URL = "https://api.sendgrid.com/v3/mail/send"
+
+
+class _SendGridMailer:
+    """Accepts boto3-SES-style send_email(**kwargs); delivers via SendGrid."""
+
+    def send_email(self, **kw):
+        api_key = os.environ.get("SENDGRID_API_KEY")
+        if not api_key:
+            raise RuntimeError("SENDGRID_API_KEY is not set on this host")
+
+        source = kw.get("Source") or RESET_FROM
+        to_addrs = (kw.get("Destination") or {}).get("ToAddresses") or []
+        if not to_addrs:
+            raise RuntimeError("no recipient")
+
+        message = kw.get("Message") or {}
+        subject = (message.get("Subject") or {}).get("Data") or ""
+        body = message.get("Body") or {}
+
+        # SendGrid requires text/plain BEFORE text/html when both are present.
+        content = []
+        if "Text" in body:
+            content.append({"type": "text/plain", "value": (body["Text"] or {}).get("Data", "")})
+        if "Html" in body:
+            content.append({"type": "text/html", "value": (body["Html"] or {}).get("Data", "")})
+        if not content:
+            content = [{"type": "text/plain", "value": ""}]
+
+        payload = {
+            "personalizations": [{"to": [{"email": a} for a in to_addrs]}],
+            "from": {"email": source, "name": "TaxStat360"},
+            "subject": subject,
+            "content": content,
+        }
+        reply_to = kw.get("ReplyToAddresses") or []
+        if reply_to:
+            payload["reply_to"] = {"email": reply_to[0]}
+
+        r = requests.post(
+            SENDGRID_URL,
+            json=payload,
+            headers={"Authorization": "Bearer " + api_key},
+            timeout=15,
+        )
+        if r.status_code >= 300:
+            raise RuntimeError("SendGrid " + str(r.status_code) + ": " + r.text[:300])
+        return {"MessageId": r.headers.get("X-Message-Id", "")}
+
+
+def _mailer():
+    """Single place email delivery is chosen. Swap providers here, nowhere else."""
+    return _SendGridMailer()
 RESET_TTL = 3600
 VERIFY_TTL = 86400
 
@@ -955,7 +1032,7 @@ def _send_verification_email(email, verify_tok):
         '<p style="color:#475569;font-size:13px">If you did not create this account, you can ignore this email.</p>'
         "</div>"
     )
-    ses = boto3.client("ses", region_name="us-east-1")
+    ses = _mailer()   # AUDIT F-8d: SendGrid, not SES (SES sandbox drops all customer mail)
     ses.send_email(
         Source=RESET_FROM,
         Destination={"ToAddresses": [email]},
@@ -1036,7 +1113,7 @@ def _send_trial_confirmation_email(email, name, plan, billing):
         'taxstat360.com/terms</a></p>'
         '</div>'
     )
-    ses = boto3.client("ses", region_name="us-east-1")
+    ses = _mailer()   # AUDIT F-8d: SendGrid, not SES (SES sandbox drops all customer mail)
     ses.send_email(
         Source=RESET_FROM,
         Destination={"ToAddresses": [email]},
@@ -2351,7 +2428,7 @@ def forgot_password(r: ForgotReq, request: Request):
         ddb_put_user(email, x)
         try:
             reset_url = f"{FRONTEND_URL}/reset-password?token={reset_tok}&email={quote(email)}"
-            ses = boto3.client("ses", region_name="us-east-1")
+            ses = _mailer()   # AUDIT F-8d: SendGrid, not SES (SES sandbox drops all customer mail)
             ses.send_email(
                 Source=RESET_FROM,
                 Destination={"ToAddresses": [email]},
