@@ -74,7 +74,18 @@ stripe.max_network_retries = 1
 MC_KEY = os.environ.get("MC_KEY", "")
 MC_LIST = "f546bd92ac"
 
-app = FastAPI()
+# Security (audit P0-#1): Swagger UI and the OpenAPI schema publish the entire API
+# surface — including the /admin routes — to anyone who loads them in a browser. They
+# are now off unless APP_ENV explicitly opts in. Default is production, i.e. disabled,
+# so a missing/typo'd env var fails closed rather than open.
+APP_ENV = os.environ.get("APP_ENV", "production").strip().lower()
+_DOCS_ENABLED = APP_ENV in ("dev", "development", "local", "test")
+
+app = FastAPI(
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
+)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -910,6 +921,73 @@ PRICE_IDS = {
 VALID_PLANS = set(PRICE_IDS.keys())
 ALLOWED_PROVIDERS = {"quickbooks", "freshbooks", "xero", "wave"}
 
+# --- Integration credentials (audit P0-#1) ------------------------------------
+# A QuickBooks/Xero access token — and especially a Xero *refresh* token — is a
+# long-lived credential to a customer's accounting system. These are now held
+# server-side on the user record and are never sent to, stored by, or accepted
+# from the browser. They must not appear in a URL, a redirect, or localStorage.
+OAUTH_STATE_MAX_AGE = 600  # 10 minutes: an OAuth round-trip is seconds, not hours
+
+
+def _integration_creds_get(email, p):
+    rec = ddb_get_user(email) or {}
+    return dict((rec.get("integrations") or {}).get(p) or {})
+
+
+def _integration_creds_save(email, p, **fields):
+    rec = ddb_get_user(email)
+    if not rec:
+        return
+    integrations = dict(rec.get("integrations") or {})
+    creds = dict(integrations.get(p) or {})
+    creds.update({k: v for k, v in fields.items() if v is not None})
+    creds["updated_at"] = int(time.time())
+    integrations[p] = creds
+    rec["integrations"] = integrations
+    ddb_put_user(email, rec)
+
+
+def _integration_creds_clear(email, p):
+    rec = ddb_get_user(email)
+    if not rec:
+        return
+    integrations = dict(rec.get("integrations") or {})
+    integrations.pop(p, None)
+    rec["integrations"] = integrations
+    ddb_put_user(email, rec)
+
+
+def _make_oauth_state(email, entity):
+    """Signed, short-lived state binding one OAuth round-trip to one user.
+
+    The provider echoes this back to /callback. It is what lets the callback know
+    which account to attach the tokens to without trusting anything the browser
+    supplies, and the HMAC + timestamp make the flow CSRF-resistant.
+    """
+    payload = f"{_norm_email(email)}|{entity}|{int(time.time())}"
+    sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
+
+
+def _verify_oauth_state(state):
+    """-> (email, entity_idx), or (None, "0") if the state is absent/forged/stale."""
+    if not state:
+        return None, "0"
+    try:
+        raw = base64.urlsafe_b64decode(state.encode()).decode()
+        payload, sig = raw.rsplit("|", 1)
+        expected = hmac.new(
+            SECRET_KEY.encode(), payload.encode(), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None, "0"
+        email, entity, ts = payload.split("|", 2)
+        if int(time.time()) - int(ts) > OAUTH_STATE_MAX_AGE:
+            return None, "0"
+        return _norm_email(email), (entity if entity.isdigit() else "0")
+    except Exception:
+        return None, "0"
+
 FRONTEND_URL = "https://www.taxstat360.com"
 RESET_FROM = "noreply@taxstat360.com"
 
@@ -1281,17 +1359,15 @@ def mfa_challenge(r: MfaChallengeReq, request: Request):
 
 
 @app.get("/auth/me")
-def auth_me(request: Request, token: str = ""):
+def auth_me(request: Request):
+    # Audit P0-#1: the `token` query parameter is gone. A credential belongs in the
+    # Authorization header or the session cookie, never in a URL where it lands in
+    # access logs and browser history. _session_email() already accepts both.
     email = _session_email(request)
     if email:
         x = ddb_get_user(email)
         if x:
             return _user_public(x, email)
-    if token:
-        u = load()
-        for em, x in u.items():
-            if x.get("tok") == token:
-                return _user_public(x, em)
     raise HTTPException(401, "Not authenticated")
 
 
@@ -1745,7 +1821,13 @@ def _xero_refresh_access_token(refresh_token):
     if not r.ok:
         logger.warning("xero token refresh: %s %s", r.status_code, r.text[:200])
         return None
-    return r.json().get("access_token")
+    tok = r.json()
+    # Xero rotates the refresh token on every use: the *new* one must be persisted or
+    # the connection dies at the next sync. The old code discarded it.
+    return {
+        "access_token": tok.get("access_token", ""),
+        "refresh_token": tok.get("refresh_token", ""),
+    }
 
 
 def _xero_row_amount(cells):
@@ -2127,12 +2209,45 @@ def _exchange_oauth_code(provider, code):
     return r.json()
 
 
-@app.get("/integrations/{p}/connect")
-def connect(p: str, entity: str = "0"):
+@app.get("/integrations/status")
+def integration_status(request: Request):
+    """Which providers this user has connected.
+
+    The browser no longer holds tokens, so it can no longer infer "connected" from the
+    presence of one in localStorage. It asks the server instead. Deliberately returns
+    booleans and timestamps only — never the credentials themselves.
+    """
+    email = _require_session_user(request)
+    rec = ddb_get_user(email) or {}
+    integrations = rec.get("integrations") or {}
+    out = {}
+    for provider in sorted(ALLOWED_PROVIDERS):
+        creds = integrations.get(provider) or {}
+        out[provider] = {
+            "connected": bool(creds.get("access_token")),
+            "updated_at": creds.get("updated_at"),
+        }
+    return out
+
+
+@app.post("/integrations/{p}/disconnect")
+def integration_disconnect(request: Request, p: str):
     if p not in ALLOWED_PROVIDERS:
         raise HTTPException(404)
+    email = _require_session_user(request)
+    _integration_creds_clear(email, p)
+    return {"ok": True, "provider": p, "connected": False}
+
+
+@app.get("/integrations/{p}/connect")
+def connect(request: Request, p: str, entity: str = "0"):
+    if p not in ALLOWED_PROVIDERS:
+        raise HTTPException(404)
+    # Only a signed-in user may start an OAuth flow: the tokens it yields are stored
+    # against their account, so we must know who they are before the round-trip begins.
+    email = _require_session_user(request)
     o = _oauth_config(p)
-    state = quote(f"ts360|{entity}")
+    state = quote(_make_oauth_state(email, entity))
     return RedirectResponse(
         f"{o['auth_url']}?client_id={o['client_id']}&redirect_uri={quote(o['redirect'])}"
         f"&response_type=code&scope={quote(o['scope'])}&state={state}"
@@ -2145,8 +2260,13 @@ def callback(p: str, code: str = "", state: str = "", realmId: str = "", tenantI
         raise HTTPException(404)
     if not code:
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=missing_code")
-    parts = unquote(state or "").split("|")
-    entity_idx = parts[-1] if len(parts) > 1 and parts[-1].isdigit() else "0"
+    # The signed state is the only thing telling us who is connecting. It was minted in
+    # /connect for an authenticated user; a forged or stale one is refused outright.
+    email, entity_idx = _verify_oauth_state(unquote(state or ""))
+    if not email:
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=invalid_state"
+        )
     access_token = ""
     refresh_token = ""
     realm_id = realmId or ""
@@ -2193,39 +2313,49 @@ def callback(p: str, code: str = "", state: str = "", realmId: str = "", tenantI
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=token_exchange")
     if not access_token:
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=no_token")
-    params = [f"{p}=connected", f"entity={entity_idx}", f"{p}_token={quote(access_token)}"]
-    if p == "quickbooks":
-        params.append(f"qb_token={quote(access_token)}")
-        if realm_id:
-            params.append(f"realm={quote(realm_id)}")
-    elif p == "xero":
-        if not tenant_id:
-            return RedirectResponse(
-                url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=missing_tenant"
-            )
-        params.append(f"tenant={quote(tenant_id)}")
-        if refresh_token:
-            params.append(f"xero_refresh={quote(refresh_token)}")
-    elif p == "freshbooks" and fb_account_id:
-        params.append(f"account={quote(str(fb_account_id))}")
-        params.append(f"fb_token={quote(access_token)}")
-    return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?" + "&".join(params))
+    if p == "xero" and not tenant_id:
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=missing_tenant"
+        )
+    # Audit P0-#1: tokens are persisted against the user and the browser is redirected
+    # back with nothing but a "connected" flag. Previously the access token — and the
+    # Xero refresh token — travelled in this redirect URL, which put a live credential
+    # to the customer's books into the address bar, browser history, and localStorage.
+    _integration_creds_save(
+        email,
+        p,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        realm_id=realm_id,
+        tenant_id=tenant_id,
+        account_id=str(fb_account_id or ""),
+    )
+    return RedirectResponse(
+        url=f"{FRONTEND_URL}/calculate-tax?{p}=connected&entity={entity_idx}"
+    )
 
 
 @app.get("/integrations/{p}/data")
-def integration_data(
-    p: str,
-    token: str = "",
-    realm: str = "",
-    tenant: str = "",
-    account: str = "",
-    year: str = "",
-    refresh_token: str = "",
-):
+def integration_data(request: Request, p: str, year: str = ""):
+    """Return the connected provider's P&L for `year`.
+
+    Audit P0-#1: this route was previously UNAUTHENTICATED and took the provider access
+    token — and the Xero refresh token — as URL query parameters, which made it an open
+    proxy into any customer's accounting system for anyone holding a leaked token. It
+    now requires a session and loads the credentials from that user's own record, so no
+    token appears in a URL, an access log, or the browser.
+    """
     if p not in ALLOWED_PROVIDERS:
         raise HTTPException(404)
+    email = _require_session_user(request)
+    creds = _integration_creds_get(email, p)
+    token = creds.get("access_token", "")
     if not token:
-        return {"error": "missing token"}
+        return {"error": "not connected"}
+    realm = creds.get("realm_id", "")
+    tenant = creds.get("tenant_id", "")
+    account = creds.get("account_id", "")
+    refresh_token = creds.get("refresh_token", "")
     start, end = _pnl_date_range(year)
     try:
         if p == "quickbooks":
@@ -2248,8 +2378,15 @@ def integration_data(
             access = token
             if refresh_token:
                 refreshed = _xero_refresh_access_token(refresh_token)
-                if refreshed:
-                    access = refreshed
+                if refreshed and refreshed.get("access_token"):
+                    access = refreshed["access_token"]
+                    # Xero rotates refresh tokens; store the new pair or the next sync fails.
+                    _integration_creds_save(
+                        email,
+                        "xero",
+                        access_token=access,
+                        refresh_token=refreshed.get("refresh_token") or refresh_token,
+                    )
             r = requests.get(
                 "https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss",
                 params={"fromDate": start, "toDate": end, "standardLayout": "true"},
