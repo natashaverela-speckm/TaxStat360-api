@@ -2028,13 +2028,24 @@ def integration_data(
     raise HTTPException(404)
 
 
-@app.post("/aria")
-async def aria_chat(request: Request):
+def _require_minimum_plan(request: Request, minimum: str):
+    """Session-required plan floor (DynamoDB plan is source of truth)."""
     email = _require_session_user(request)
     user = ddb_get_user(email) or {}
     plan = user.get("plan", "starter")
-    if PLAN_ORDER.index(plan) < PLAN_ORDER.index("professional"):
-        raise HTTPException(403, "Professional plan required")
+    try:
+        if PLAN_ORDER.index(plan) < PLAN_ORDER.index(minimum):
+            raise HTTPException(
+                403, f"{minimum.capitalize()} plan required"
+            )
+    except ValueError:
+        raise HTTPException(403, f"{minimum.capitalize()} plan required")
+    return email, user, plan
+
+
+@app.post("/aria")
+async def aria_chat(request: Request):
+    email, user, plan = _require_minimum_plan(request, "professional")
     if not OPENAI_API_KEY:
         raise HTTPException(503, "Aria service unavailable")
     body = await request.json()
@@ -2069,6 +2080,25 @@ async def aria_chat(request: Request):
         raise HTTPException(503, "Aria service unavailable")
     reply = r.json()["choices"][0]["message"]["content"]
     return {"reply": reply}
+
+
+@app.post("/reports/cpa-briefing/authorize")
+def authorize_cpa_briefing(request: Request):
+    """Enterprise-only gate before CPA Briefing generation.
+
+    The briefing document is assembled client-side from the user's saved
+    figures; this endpoint is the server-side entitlement check so a
+    Professional account cannot bypass the upsell UI and still generate it.
+    """
+    email, _user, plan = _require_minimum_plan(request, "enterprise")
+    return {"ok": True, "feature": "cpa-briefing", "plan": plan, "email": email}
+
+
+@app.post("/reports/position-docs/authorize")
+def authorize_position_docs(request: Request):
+    """Enterprise-only gate for Position Documentation / IRS notice templates."""
+    email, _user, plan = _require_minimum_plan(request, "enterprise")
+    return {"ok": True, "feature": "position-docs", "plan": plan, "email": email}
 
 
 @app.get("/auth/verify-email")
