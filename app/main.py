@@ -1,5 +1,8 @@
 import json, logging, os, hashlib, secrets, stripe, requests, boto3, time, hmac, bcrypt, base64, io
-from datetime import date
+# AUDIT F-8c: datetime/timezone/timedelta are needed by _send_trial_confirmation_email()
+# to compute the trial-end date. Only `date` was imported; using the others without this
+# line raises NameError on every signup.
+from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
 from logging.handlers import TimedRotatingFileHandler
 from urllib.parse import quote, unquote
@@ -71,7 +74,18 @@ stripe.max_network_retries = 1
 MC_KEY = os.environ.get("MC_KEY", "")
 MC_LIST = "f546bd92ac"
 
-app = FastAPI()
+# Security (audit P0-#1): Swagger UI and the OpenAPI schema publish the entire API
+# surface — including the /admin routes — to anyone who loads them in a browser. They
+# are now off unless APP_ENV explicitly opts in. Default is production, i.e. disabled,
+# so a missing/typo'd env var fails closed rather than open.
+APP_ENV = os.environ.get("APP_ENV", "production").strip().lower()
+_DOCS_ENABLED = APP_ENV in ("dev", "development", "local", "test")
+
+app = FastAPI(
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
+)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -384,6 +398,67 @@ def _user_public(rec, email):
         "verified": rec.get("verified", False),
         "is_admin": _is_admin(email),
     }
+
+
+# --- OBS-5 ALERT RELAY (Phase 2.2c, revised 2.2c-r1, Jul 2026) -----------------
+# HISTORY: the first 2.2c relay forwarded to web3forms with a server-held key,
+# per the Batch-6 spec. Live testing revealed web3forms REJECTS server-side
+# submissions on the free plan ("Use our API in client side ... Pro plan is
+# required") — and the relay's original error handling passed that rejection
+# through as HTTP 200 {"success": false}, a silent failure. Both problems die
+# here: the relay now sends the email ITSELF via SES (the same transport the
+# password-reset and verification emails already use, from the same verified
+# sender), so there is no third party, no key anywhere, and no plan
+# restriction; and any send failure is a loud 502, never a quiet false.
+# Field whitelist, caps, subject requirement, and the 5/min/IP limit are
+# unchanged from the spec. The D-03 signup-failure alerts and the Landing
+# contact form route through here; Reply-To carries the submitter's address
+# so the owner can reply directly from the inbox.
+# Destination override via env; default matches ADMIN_EMAILS' default (which is
+# defined later in this module — do not reference it here at import time).
+ALERT_TO_EMAIL = os.environ.get("ALERT_TO_EMAIL", "support@taxstat360.com")
+_FORM_RELAY_FIELDS = ("subject", "email", "message", "from_name", "plan", "billing", "status", "detail")
+_FORM_RELAY_MAX_LEN = 4000
+
+
+@app.post("/alerts/form-relay")
+@limiter.limit("5/minute")
+async def form_relay(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "JSON body required")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "JSON object required")
+    fields = {}
+    for k in _FORM_RELAY_FIELDS:
+        v = body.get(k)
+        if v is None:
+            continue
+        fields[k] = str(v)[:_FORM_RELAY_MAX_LEN]
+    if not fields.get("subject"):
+        raise HTTPException(400, "subject is required")
+    lines = [f"{k}: {fields[k]}" for k in _FORM_RELAY_FIELDS if k in fields and k != "subject"]
+    text_body = "\n\n".join(lines) if lines else "(no fields provided)"
+    reply_to = fields.get("email", "").strip()
+    try:
+        ses = _mailer()   # AUDIT F-8d: SendGrid, not SES (SES sandbox drops all customer mail)
+        kwargs = {
+            "Source": RESET_FROM,
+            "Destination": {"ToAddresses": [ALERT_TO_EMAIL]},
+            "Message": {
+                "Subject": {"Data": fields["subject"][:998]},
+                "Body": {"Text": {"Data": text_body}},
+            },
+        }
+        if reply_to and "@" in reply_to:
+            kwargs["ReplyToAddresses"] = [reply_to]
+        ses.send_email(**kwargs)
+        return {"success": True}
+    except Exception as e:
+        # LOUD failure — an owner alert that cannot send must never pretend it did.
+        logger.error("form-relay SES send failed: %s", e)
+        raise HTTPException(502, "Alert delivery unavailable")
 
 
 # --- M2 RECORDS (DynamoDB sync) ---
@@ -817,6 +892,11 @@ class Reg(BaseModel):
     email: str
     password: str
     plan: str = "starter"
+    # AUDIT F-8c (Jul 2026): the auto-renewal acknowledgment must state the AMOUNT and
+    # CADENCE the customer actually agreed to. The signup page already knows whether they
+    # chose monthly or annual; it simply never sent it. Defaults to "monthly" so an older
+    # client that omits the field still produces a correct (conservative) email.
+    billing: str = "monthly"
     payment_method_id: str = ""
 
 
@@ -841,8 +921,152 @@ PRICE_IDS = {
 VALID_PLANS = set(PRICE_IDS.keys())
 ALLOWED_PROVIDERS = {"quickbooks", "freshbooks", "xero", "wave"}
 
+# --- Integration credentials (audit P0-#1) ------------------------------------
+# A QuickBooks/Xero access token — and especially a Xero *refresh* token — is a
+# long-lived credential to a customer's accounting system. These are now held
+# server-side on the user record and are never sent to, stored by, or accepted
+# from the browser. They must not appear in a URL, a redirect, or localStorage.
+OAUTH_STATE_MAX_AGE = 600  # 10 minutes: an OAuth round-trip is seconds, not hours
+
+
+def _integration_creds_get(email, p):
+    rec = ddb_get_user(email) or {}
+    return dict((rec.get("integrations") or {}).get(p) or {})
+
+
+def _integration_creds_save(email, p, **fields):
+    rec = ddb_get_user(email)
+    if not rec:
+        return
+    integrations = dict(rec.get("integrations") or {})
+    creds = dict(integrations.get(p) or {})
+    creds.update({k: v for k, v in fields.items() if v is not None})
+    creds["updated_at"] = int(time.time())
+    integrations[p] = creds
+    rec["integrations"] = integrations
+    ddb_put_user(email, rec)
+
+
+def _integration_creds_clear(email, p):
+    rec = ddb_get_user(email)
+    if not rec:
+        return
+    integrations = dict(rec.get("integrations") or {})
+    integrations.pop(p, None)
+    rec["integrations"] = integrations
+    ddb_put_user(email, rec)
+
+
+def _make_oauth_state(email, entity):
+    """Signed, short-lived state binding one OAuth round-trip to one user.
+
+    The provider echoes this back to /callback. It is what lets the callback know
+    which account to attach the tokens to without trusting anything the browser
+    supplies, and the HMAC + timestamp make the flow CSRF-resistant.
+    """
+    payload = f"{_norm_email(email)}|{entity}|{int(time.time())}"
+    sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
+
+
+def _verify_oauth_state(state):
+    """-> (email, entity_idx), or (None, "0") if the state is absent/forged/stale."""
+    if not state:
+        return None, "0"
+    try:
+        raw = base64.urlsafe_b64decode(state.encode()).decode()
+        payload, sig = raw.rsplit("|", 1)
+        expected = hmac.new(
+            SECRET_KEY.encode(), payload.encode(), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None, "0"
+        email, entity, ts = payload.split("|", 2)
+        if int(time.time()) - int(ts) > OAUTH_STATE_MAX_AGE:
+            return None, "0"
+        return _norm_email(email), (entity if entity.isdigit() else "0")
+    except Exception:
+        return None, "0"
+
 FRONTEND_URL = "https://www.taxstat360.com"
 RESET_FROM = "noreply@taxstat360.com"
+
+# ---------------------------------------------------------------------------------
+# AUDIT F-8d (Jul 2026) - EMAIL DELIVERY MOVED FROM AWS SES TO SENDGRID.
+#
+# WHY. Our AWS SES account is in the SANDBOX, which silently discards every message to
+# an address that has not been individually verified in the AWS console. Only four
+# addresses were verified, so in practice NO customer could ever receive ANY email:
+# not the verification link (so they could never activate), not the billing
+# acknowledgment, not a password reset (so they could never get back in). Nothing
+# bounced and nothing errored - AWS simply dropped them. We requested production
+# access and AWS Trust and Safety declined without stating a reason.
+#
+# SendGrid is already paid for (Essentials, 50k/month) and taxstat360.com is already
+# domain-authenticated there, so it can send to anyone today.
+#
+# HOW. _SendGridMailer is a drop-in stand-in for the boto3 SES client, accepting the
+# exact same send_email(**kwargs) shape this file already uses. That is deliberate:
+# every existing call site stays byte-for-byte unchanged, so this swap cannot alter
+# any email's content - only the pipe it travels down.
+#
+# REQUIRES: SENDGRID_API_KEY in /etc/environment on the API host (systemd reads it via
+# EnvironmentFile). Without it, sends raise and are caught by the callers' try/except.
+# ---------------------------------------------------------------------------------
+
+SENDGRID_URL = "https://api.sendgrid.com/v3/mail/send"
+
+
+class _SendGridMailer:
+    """Accepts boto3-SES-style send_email(**kwargs); delivers via SendGrid."""
+
+    def send_email(self, **kw):
+        api_key = os.environ.get("SENDGRID_API_KEY")
+        if not api_key:
+            raise RuntimeError("SENDGRID_API_KEY is not set on this host")
+
+        source = kw.get("Source") or RESET_FROM
+        to_addrs = (kw.get("Destination") or {}).get("ToAddresses") or []
+        if not to_addrs:
+            raise RuntimeError("no recipient")
+
+        message = kw.get("Message") or {}
+        subject = (message.get("Subject") or {}).get("Data") or ""
+        body = message.get("Body") or {}
+
+        # SendGrid requires text/plain BEFORE text/html when both are present.
+        content = []
+        if "Text" in body:
+            content.append({"type": "text/plain", "value": (body["Text"] or {}).get("Data", "")})
+        if "Html" in body:
+            content.append({"type": "text/html", "value": (body["Html"] or {}).get("Data", "")})
+        if not content:
+            content = [{"type": "text/plain", "value": ""}]
+
+        payload = {
+            "personalizations": [{"to": [{"email": a} for a in to_addrs]}],
+            "from": {"email": source, "name": "TaxStat360"},
+            "subject": subject,
+            "content": content,
+        }
+        reply_to = kw.get("ReplyToAddresses") or []
+        if reply_to:
+            payload["reply_to"] = {"email": reply_to[0]}
+
+        r = requests.post(
+            SENDGRID_URL,
+            json=payload,
+            headers={"Authorization": "Bearer " + api_key},
+            timeout=15,
+        )
+        if r.status_code >= 300:
+            raise RuntimeError("SendGrid " + str(r.status_code) + ": " + r.text[:300])
+        return {"MessageId": r.headers.get("X-Message-Id", "")}
+
+
+def _mailer():
+    """Single place email delivery is chosen. Swap providers here, nowhere else."""
+    return _SendGridMailer()
 RESET_TTL = 3600
 VERIFY_TTL = 86400
 
@@ -886,11 +1110,95 @@ def _send_verification_email(email, verify_tok):
         '<p style="color:#475569;font-size:13px">If you did not create this account, you can ignore this email.</p>'
         "</div>"
     )
-    ses = boto3.client("ses", region_name="us-east-1")
+    ses = _mailer()   # AUDIT F-8d: SendGrid, not SES (SES sandbox drops all customer mail)
     ses.send_email(
         Source=RESET_FROM,
         Destination={"ToAddresses": [email]},
         Message={"Subject": {"Data": "Confirm your email for TaxStat360"}, "Body": {"Html": {"Data": html}}},
+    )
+
+
+# ---------------------------------------------------------------------------------
+# AUDIT F-8c (Jul 2026) - AUTO-RENEWAL ACKNOWLEDGMENT.
+#
+# The only email sent at signup was "Confirm your email" - a bare token link with no
+# billing information in it at all. That is an identity check, not a renewal
+# acknowledgment. They are different documents with different jobs.
+#
+# California's Automatic Renewal Law and the FTC negative-option rule expect the renewal
+# terms in a record the customer can RETAIN, stating: (1) that it renews automatically,
+# (2) the amount, (3) the frequency, (4) the date of the first charge, and (5) how to
+# cancel. The verification email carried none of the five.
+#
+# WORDING IS DELIBERATELY IDENTICAL to the signup page (frontend constants.js ->
+# renewalDisclosure()) and to Terms of Service section 3. Three copies of a promise that
+# can drift is exactly how "Cancel in one click" ended up live on a site where
+# cancelling took two clicks. If you change one, change all three.
+# ---------------------------------------------------------------------------------
+
+TRIAL_DAYS = 7
+
+# Must stay in lockstep with frontend src/constants.js (PLAN_PRICING).
+# annual_total = monthly * 10  ("two months free").
+PLAN_PRICES = {
+    "starter":      {"monthly": 79,  "annual_total": 790,  "label": "Starter"},
+    "professional": {"monthly": 149, "annual_total": 1490, "label": "Professional"},
+    "enterprise":   {"monthly": 299, "annual_total": 2990, "label": "Enterprise"},
+}
+
+
+def _send_trial_confirmation_email(email, name, plan, billing):
+    p = PLAN_PRICES.get(plan, PLAN_PRICES["starter"])
+    is_annual = (billing or "monthly").lower() == "annual"
+    amount = "$" + format(p["annual_total"] if is_annual else p["monthly"], ",")
+    cadence = "every 12 months" if is_annual else "every month"
+    end_date = (datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)).strftime("%B %d, %Y").replace(" 0", " ")
+    greeting = "Hi " + name + "," if name else "Hi,"
+
+    html = (
+        '<div style="font-family:-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:32px 24px">'
+        '<div style="font-weight:800;font-size:20px;color:#0D1B3E;margin-bottom:20px">'
+        'TaxStat<span style="color:#2563EB">360</span></div>'
+        f'<p style="font-size:15px;color:#0D1B3E">{greeting}</p>'
+        f'<p style="font-size:15px;line-height:1.6;color:#334155">Your {TRIAL_DAYS}-day free trial of '
+        f'<strong>TaxStat360 {p["label"]}</strong> is active. Here are your billing terms, in '
+        'writing, so you have them.</p>'
+        '<div style="background:#FFFBEB;border:1px solid #FCD34D;border-radius:10px;padding:16px;margin:18px 0">'
+        '<p style="margin:0 0 10px;font-weight:700;font-size:15px;color:#92400E">'
+        'Your subscription renews automatically.</p>'
+        f'<p style="margin:0;font-size:14px;line-height:1.7;color:#92400E">'
+        f'Trial ends: <strong>{end_date}</strong><br>'
+        f'You will be charged: <strong>{amount} on {end_date}</strong><br>'
+        f'Then: <strong>{amount} {cadence}</strong>, automatically, until you cancel.</p>'
+        '<p style="margin:10px 0 0;font-size:13px;color:#92400E">You have not been charged anything yet.</p>'
+        '</div>'
+        '<p style="font-weight:700;font-size:15px;color:#0D1B3E;margin-bottom:6px">How to cancel</p>'
+        f'<p style="font-size:14px;line-height:1.6;color:#334155">Sign in and go to '
+        '<strong>Settings &rarr; Manage Billing</strong>. If you cancel before '
+        f'<strong>{end_date}</strong>, <strong>you will not be charged at all</strong>. If you '
+        'cancel after a billing period has begun, your access continues to the end of that '
+        'period and you are not charged again.</p>'
+        '<p style="margin:20px 0"><a href="https://www.taxstat360.com/settings" '
+        'style="background:#0D1B3E;color:#fff;padding:12px 22px;border-radius:8px;'
+        'text-decoration:none;display:inline-block;font-weight:700;font-size:14px">'
+        'Manage or cancel your subscription</a></p>'
+        '<p style="font-size:12px;color:#64748B;line-height:1.6">No refunds are given for billing '
+        'periods already charged, including annual plans. Cancelling stops future renewals; it '
+        'does not refund the current period.</p>'
+        '<p style="font-size:12px;color:#64748B;line-height:1.6">Questions: '
+        '<a href="mailto:support@taxstat360.com" style="color:#2563EB">support@taxstat360.com</a><br>'
+        'Full terms: <a href="https://www.taxstat360.com/terms" style="color:#2563EB">'
+        'taxstat360.com/terms</a></p>'
+        '</div>'
+    )
+    ses = _mailer()   # AUDIT F-8d: SendGrid, not SES (SES sandbox drops all customer mail)
+    ses.send_email(
+        Source=RESET_FROM,
+        Destination={"ToAddresses": [email]},
+        Message={
+            "Subject": {"Data": "Your TaxStat360 trial has started - what happens on " + end_date},
+            "Body": {"Html": {"Data": html}},
+        },
     )
 
 
@@ -919,6 +1227,13 @@ def register(r: Reg, request: Request):
         _send_verification_email(email, verify_tok)
     except Exception as e:
         logger.warning("SES verify error: %s", e)
+    # AUDIT F-8c: the auto-renewal acknowledgment. Non-fatal by design - a failed email
+    # must never roll back a successful signup - but logged at ERROR, not WARNING, because
+    # a silently-missing acknowledgment IS the compliance gap this closes.
+    try:
+        _send_trial_confirmation_email(email, r.name, plan, r.billing)
+    except Exception as e:
+        logger.error("TRIAL_CONFIRMATION_EMAIL_FAILED email=%s error=%s", email, e)
     session_token = _make_session(email)
     resp = JSONResponse({
         "ok": True,
@@ -1044,17 +1359,15 @@ def mfa_challenge(r: MfaChallengeReq, request: Request):
 
 
 @app.get("/auth/me")
-def auth_me(request: Request, token: str = ""):
+def auth_me(request: Request):
+    # Audit P0-#1: the `token` query parameter is gone. A credential belongs in the
+    # Authorization header or the session cookie, never in a URL where it lands in
+    # access logs and browser history. _session_email() already accepts both.
     email = _session_email(request)
     if email:
         x = ddb_get_user(email)
         if x:
             return _user_public(x, email)
-    if token:
-        u = load()
-        for em, x in u.items():
-            if x.get("tok") == token:
-                return _user_public(x, em)
     raise HTTPException(401, "Not authenticated")
 
 
@@ -1136,9 +1449,37 @@ def biz(user=Depends(get_user_from_token)):
     return {"status": "saved"}
 
 
+def _check_expected_user(user_id, expected):
+    """PHASE 2.2 IDENTITY GUARD (D-1 countermeasure, Jul 2026).
+
+    The July 3 "destroyed siblings" incident was a session identity flip: the
+    browser's effective session switched accounts mid-operation (staged
+    cookie-Domain change + two logins on one machine), so writes landed in —
+    and reads returned — a different userId partition. Nothing was deleted;
+    everything was mis-filed and "vanished" from view. The client now pins
+    which account it BELIEVES each records request is for (X-Expected-User
+    header on GET/DELETE, expectedUser field on PUT); a mismatch fails loudly
+    here with a 409 instead of mis-filing silently. Absent pin ⇒ no check
+    (older clients keep working)."""
+    if expected is None or str(expected).strip() == "":
+        return
+    if _norm_email(str(expected)) != user_id:
+        # PHASE 4 (audit-trail gap found by the Jul-8 forensics drill): an
+        # identity mismatch is the exact signature of the D-1 incident class —
+        # it deserves a permanent audit row, not just a 409 in an access log.
+        _write_audit("identity.mismatch", user_id, _norm_email(str(expected)),
+                     "blocked", "expectedUser pin did not match session")
+        raise HTTPException(
+            409,
+            "Session/account mismatch: this browser is signed in as a different "
+            "account than this page expects. Reload the page and sign in again.",
+        )
+
+
 @app.get("/records")
 def list_records(request: Request):
     user_id = _require_session_user(request)
+    _check_expected_user(user_id, request.headers.get("x-expected-user"))
     items = _ddb_query_records(user_id)
     out = [_record_from_item(it) for it in items]
     out.sort(key=lambda r: r.get("updatedAt", r.get("id", 0)), reverse=True)
@@ -1151,6 +1492,9 @@ async def upsert_record(request: Request):
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(400, "Record must be a JSON object")
+    # Identity guard — see _check_expected_user. Popped so the pin is transport
+    # metadata, never persisted (writtenBySession/-Ip remain the forensics).
+    _check_expected_user(user_id, body.pop("expectedUser", None))
     record_id = body.get("id")
     if record_id is None:
         raise HTTPException(400, "Record id is required")
@@ -1181,10 +1525,18 @@ async def upsert_record(request: Request):
 @app.delete("/records/{record_id}")
 def delete_record(record_id: int, request: Request):
     user_id = _require_session_user(request)
+    _check_expected_user(user_id, request.headers.get("x-expected-user"))
     existing = _records_tbl.get_item(Key={"userId": user_id, "recordId": record_id}).get("Item")
     if not existing:
+        _write_audit("record.delete", user_id, user_id, "not_found", f"recordId={record_id}")
         raise HTTPException(404, "Record not found")
     _records_tbl.delete_item(Key={"userId": user_id, "recordId": record_id})
+    # PHASE 4 (Jul-8 drill): record deletions previously left NO audit entry —
+    # only account deletions did — so a "where did my records go?" question
+    # cost an hour of forensics instead of one table lookup. The record's name
+    # rides in `detail` so the audit row alone answers "what was deleted".
+    _write_audit("record.delete", user_id, user_id, "completed",
+                 f"recordId={record_id}; name={str(existing.get('name') or '')[:120]}")
     return {"ok": True}
 
 
@@ -1353,14 +1705,65 @@ OAUTH_SECRET_ENV = {
 }
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+# AUDIT N-2 BACKEND FIX (Jul 2026). ARIA_MODEL: gpt-4o-mini has an Oct-2023 training
+# cutoff and, before this fix, answered depreciation/limit questions with repealed
+# pre-OBBBA law (audit captured "20% bonus depreciation" advice for 2026; correct: 100%,
+# permanent). The CURRENT LAW block below makes answers correct regardless of model
+# vintage. RECOMMENDATION: also set the ARIA_MODEL env var to a current-generation
+# model whose training postdates the OBBBA (July 2025) for better handling of topics
+# outside the brief. ANNUAL MAINTENANCE: update the figures below together with the
+# frontend TAX_TABLES (src/taxCalc.js) and the Aria.jsx guard facts each January.
 ARIA_MODEL = os.environ.get("ARIA_MODEL", "gpt-4o-mini")
 ARIA_SYSTEM = (
     "You are Aria, the TaxStat360 AI tax strategist. Help business owners with federal tax "
     "planning, estimated payments, entity structure, deductions, and compliance-aware guidance. "
-    "Be concise, practical, and remind users this is planning guidance—not filing advice. "
-    "Never invent user-specific numbers; ask for details when needed."
+    "Be concise, practical, and remind users this is planning guidance\u2014not filing advice. "
+    "Never invent user-specific numbers; ask for details when needed.\n\n"
+    "CURRENT LAW \u2014 AUTHORITATIVE, VERIFIED JULY 2026. Your training data may predate the "
+    "One Big Beautiful Bill Act (OBBBA, P.L. 119-21, enacted July 4, 2025). The following is "
+    "current law and SUPERSEDES anything you learned in training. Never present pre-OBBBA "
+    "rules (e.g., the bonus-depreciation phase-down, TCJA sunsets) as current:\n"
+    "\u2022 Bonus depreciation: 100%, PERMANENT (\u00a7168(k), OBBBA \u00a770301) for qualified "
+    "property acquired after Jan 19, 2025. The 80/60/40/20% phase-down is repealed for new "
+    "acquisitions. Cost-segregation 5/7/15-year property placed in service in 2026 gets 100%.\n"
+    "\u2022 \u00a7179: $2.5M limit / $4M phase-out (2025, indexed for 2026).\n"
+    "\u2022 2026 figures (Rev. Proc. 2025-32): standard deduction $16,100 single / $32,200 MFJ / "
+    "$24,150 HOH; 37% bracket begins at $640,600 single / $768,700 MFJ; long-term capital gains "
+    "0% band tops at $49,450 single / $98,900 MFJ, 20% above $545,500 / $613,700.\n"
+    "\u2022 \u00a7199A QBI: 20% deduction, PERMANENT (OBBBA); 2026 thresholds $201,775 single / "
+    "$403,500 MFJ; $75K/$150K phase-in ranges; $400 minimum deduction; SSTB benefit fully "
+    "phased out above threshold + phase-in.\n"
+    "\u2022 SALT cap 2026 (OBBBA \u00a770120): $40,400 ($20,200 MFS), reduced by 30% of MAGI over "
+    "$505,000 ($252,500 MFS), floor $10,000 ($5,000 MFS). A pass-through entity-level tax "
+    "election (PTET) can restore the FEDERAL deduction for state taxes on business income.\n"
+    "\u2022 2026 retirement (Notice 2025-67): 401(k) deferral $24,500; \u00a7415(c) limit $72,000; "
+    "age-50 catch-up $8,000 (ages 60\u201363: $11,250); IRA $7,500 + $1,100 catch-up; SEP max "
+    "$72,000. HSA (Rev. Proc. 2025-19): $4,400 self-only / $8,750 family.\n"
+    "\u2022 Child tax credit: $2,200 per child. AMT 2026: exemption $90,100 single / $140,200 "
+    "MFJ; phase-out begins $500K / $1M at a 50% rate.\n"
+    "\u2022 \u00a7461(l) excess business loss 2026: $256,000 single / $512,000 MFJ (Rev. Proc. "
+    "2025-32 \u00a74.31). OBBBA RESET these DOWN from 2025's $313K/$626K \u2014 do not project them "
+    "upward from prior years.\n"
+    "\u2022 Charitable 2026: itemizers face a 0.5%-of-AGI floor; non-itemizers may deduct up to "
+    "$1,000 / $2,000 MFJ (\u00a7170(p)). New \u00a768 (OBBBA \u00a770111): itemized deductions reduced "
+    "by 2/37 of the lesser of total itemized deductions or taxable income over the 37% "
+    "threshold.\n"
+    "\u2022 S corporations: >2% shareholder health premiums are deductible only up to W-2 wages "
+    "from the S-corp (\u00a7162(l)(5)(A); Notice 2008-1 requires Box-1 inclusion). Distributions "
+    "from an S-corp with C-corp accumulated E&P follow \u00a71368(c): AAA first, then DIVIDENDS to "
+    "the extent of E&P, then basis recovery. The \u00a73121(b)(3)(A) FICA exemption for employing "
+    "one's under-18 child NEVER applies to a corporation, including an S-corp.\n"
+    "\u2022 Real estate: REPS requires BOTH \u00a7469(c)(7)(B) tests (>750 hours AND more than half "
+    "of all personal-service hours) plus material participation per rental or the "
+    "\u00a71.469-9(g) aggregation election. Short-term rentals averaging 7 days or less per stay "
+    "are not \u00a7469(c)(2) rental activities (Reg. \u00a71.469-1T(e)(3)(ii)(A)) \u2014 material "
+    "participation alone makes those losses nonpassive.\n"
+    "\u2022 Estimated tax: safe harbor is 110% of prior-year tax when prior-year AGI exceeded "
+    "$150K ($75K MFS) \u2014 \u00a76654(d)(1)(C)(i); penalties accrue per installment.\n"
+    "If a question involves rates, limits, or thresholds NOT listed above, say the figure may "
+    "have changed since your training and direct the user to the verified tables in the Tax "
+    "Tracker rather than guessing."
 )
-
 
 def _oauth_secret(provider):
     env_key = OAUTH_SECRET_ENV.get(provider, "")
@@ -1418,7 +1821,13 @@ def _xero_refresh_access_token(refresh_token):
     if not r.ok:
         logger.warning("xero token refresh: %s %s", r.status_code, r.text[:200])
         return None
-    return r.json().get("access_token")
+    tok = r.json()
+    # Xero rotates the refresh token on every use: the *new* one must be persisted or
+    # the connection dies at the next sync. The old code discarded it.
+    return {
+        "access_token": tok.get("access_token", ""),
+        "refresh_token": tok.get("refresh_token", ""),
+    }
 
 
 def _xero_row_amount(cells):
@@ -1800,164 +2209,78 @@ def _exchange_oauth_code(provider, code):
     return r.json()
 
 
-OAUTH_STATE_TTL = 600
+@app.get("/integrations/status")
+def integration_status(request: Request):
+    """Which providers this user has connected.
+
+    The browser no longer holds tokens, so it can no longer infer "connected" from the
+    presence of one in localStorage. It asks the server instead. Deliberately returns
+    booleans and timestamps only — never the credentials themselves.
+    """
+    email = _require_session_user(request)
+    rec = ddb_get_user(email) or {}
+    integrations = rec.get("integrations") or {}
+    out = {}
+    for provider in sorted(ALLOWED_PROVIDERS):
+        creds = integrations.get(provider) or {}
+        out[provider] = {
+            "connected": bool(creds.get("access_token")),
+            "updated_at": creds.get("updated_at"),
+        }
+    return out
 
 
-def _sign_oauth_state(email, entity_idx="0"):
-    """HMAC state so the callback can bind the token write to a user without
-    putting credentials in the browser redirect URL."""
-    email = _norm_email(email)
-    entity_idx = str(entity_idx if str(entity_idx).isdigit() else "0")
-    ts = str(int(time.time()))
-    payload = f"{email}|{entity_idx}|{ts}"
-    sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
-    return f"{payload}|{sig}"
+@app.post("/integrations/{p}/disconnect")
+def integration_disconnect(request: Request, p: str):
+    if p not in ALLOWED_PROVIDERS:
+        raise HTTPException(404)
+    email = _require_session_user(request)
+    _integration_creds_clear(email, p)
+    return {"ok": True, "provider": p, "connected": False}
 
 
-def _verify_oauth_state(state):
-    raw = unquote(state or "")
-    parts = raw.split("|")
-    if len(parts) != 4:
-        return None, "0"
-    email, entity_idx, ts, sig = parts
-    payload = f"{email}|{entity_idx}|{ts}"
-    expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
-    if not hmac.compare_digest(sig, expected):
-        return None, "0"
-    try:
-        if int(time.time()) - int(ts) > OAUTH_STATE_TTL:
-            return None, "0"
-    except (TypeError, ValueError):
-        return None, "0"
-    return _norm_email(email), (entity_idx if entity_idx.isdigit() else "0")
-
-
-def _provider_connected(user, provider):
-    entry = ((user or {}).get("integrations") or {}).get(provider) or {}
-    return bool(entry.get("access_token_enc"))
-
-
-def _save_provider_creds(
-    email,
-    user,
-    provider,
-    *,
-    access_token,
-    refresh_token="",
-    realm_id="",
-    tenant_id="",
-    account_id="",
-):
-    integ = dict(user.get("integrations") or {})
-    entry = {
-        "access_token_enc": _mfa_encrypt(access_token),
-        "connected_at": int(time.time()),
-    }
-    if refresh_token:
-        entry["refresh_token_enc"] = _mfa_encrypt(refresh_token)
-    if realm_id:
-        entry["realm_id"] = str(realm_id)
-    if tenant_id:
-        entry["tenant_id"] = str(tenant_id)
-    if account_id:
-        entry["account_id"] = str(account_id)
-    integ[provider] = entry
-    user["integrations"] = integ
-    ddb_put_user(email, user)
-
-
-def _clear_provider_creds(email, user, provider):
-    integ = dict(user.get("integrations") or {})
-    if provider in integ:
-        integ.pop(provider, None)
-        user["integrations"] = integ
-        ddb_put_user(email, user)
-
-
-def _load_provider_creds(user, provider):
-    entry = ((user or {}).get("integrations") or {}).get(provider) or {}
-    enc = entry.get("access_token_enc")
-    if not enc:
-        return None
-    try:
-        access = _mfa_decrypt(enc)
-    except Exception as e:
-        logger.warning("integration token decrypt failed provider=%s: %s", provider, e)
-        return None
-    refresh = ""
-    if entry.get("refresh_token_enc"):
-        try:
-            refresh = _mfa_decrypt(entry["refresh_token_enc"])
-        except Exception as e:
-            logger.warning("integration refresh decrypt failed provider=%s: %s", provider, e)
-    return {
-        "access_token": access,
-        "refresh_token": refresh,
-        "realm_id": entry.get("realm_id", "") or "",
-        "tenant_id": entry.get("tenant_id", "") or "",
-        "account_id": entry.get("account_id", "") or "",
-    }
-
-
-def _oauth_authorize_url(provider, email, entity_idx="0"):
+def _oauth_authorize_redirect_url(provider, email, entity="0"):
     o = _oauth_config(provider)
-    state = _sign_oauth_state(email, entity_idx)
+    state = quote(_make_oauth_state(email, entity))
     return (
         f"{o['auth_url']}?client_id={o['client_id']}&redirect_uri={quote(o['redirect'])}"
-        f"&response_type=code&scope={quote(o['scope'])}&state={quote(state)}"
+        f"&response_type=code&scope={quote(o['scope'])}&state={state}"
     )
 
 
 @app.get("/integrations/{p}/connect-url")
-def connect_url(p: str, request: Request, entity: str = "0"):
-    """Return the provider authorize URL (Bearer/cookie auth). Preferred over
-    /connect so the SPA can attach Authorization before leaving the page."""
+def connect_url(request: Request, p: str, entity: str = "0"):
+    """JSON authorize URL for the SPA (Bearer/cookie). Prefer this over /connect
+    so Authorization can be attached before leaving the page."""
     if p not in ALLOWED_PROVIDERS:
         raise HTTPException(404)
     email = _require_session_user(request)
-    return {"url": _oauth_authorize_url(p, email, entity), "provider": p}
+    return {"url": _oauth_authorize_redirect_url(p, email, entity), "provider": p}
 
 
 @app.get("/integrations/{p}/connect")
-def connect(p: str, request: Request, entity: str = "0"):
+def connect(request: Request, p: str, entity: str = "0"):
     if p not in ALLOWED_PROVIDERS:
         raise HTTPException(404)
-    email = _session_email(request)
-    if not email:
-        return RedirectResponse(url=f"{FRONTEND_URL}/login?next=/calculate-tax")
-    return RedirectResponse(url=_oauth_authorize_url(p, email, entity))
+    # Only a signed-in user may start an OAuth flow: the tokens it yields are stored
+    # against their account, so we must know who they are before the round-trip begins.
+    email = _require_session_user(request)
+    return RedirectResponse(url=_oauth_authorize_redirect_url(p, email, entity))
 
 
 @app.get("/integrations/{p}/callback")
-def callback(
-    p: str,
-    request: Request,
-    code: str = "",
-    state: str = "",
-    realmId: str = "",
-    tenantId: str = "",
-):
+def callback(p: str, code: str = "", state: str = "", realmId: str = "", tenantId: str = ""):
     if p not in ALLOWED_PROVIDERS:
         raise HTTPException(404)
     if not code:
-        logger.warning("oauth callback %s missing authorization code", p)
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=missing_code")
-
-    email, entity_idx = _verify_oauth_state(state)
+    # The signed state is the only thing telling us who is connecting. It was minted in
+    # /connect for an authenticated user; a forged or stale one is refused outright.
+    email, entity_idx = _verify_oauth_state(unquote(state or ""))
     if not email:
-        # Fallback: session cookie on the API host (same OAuth return).
-        email = _session_email(request)
-        parts = unquote(state or "").split("|")
-        entity_idx = parts[1] if len(parts) > 1 and parts[1].isdigit() else "0"
-    if not email:
-        logger.warning("oauth callback %s: no verified state and no session", p)
-        return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=not_authenticated")
-
-    user = ddb_get_user(email)
-    if not user:
-        logger.warning("oauth callback %s: user missing email=%s", p, email)
-        return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=user_missing")
-
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=invalid_state"
+        )
     access_token = ""
     refresh_token = ""
     realm_id = realmId or ""
@@ -1999,78 +2322,55 @@ def callback(
                 )
     except HTTPException:
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=token_exchange")
-    except Exception:
+    except Exception as e:
         logger.exception("oauth callback %s failed", p)
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=token_exchange")
-
     if not access_token:
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=no_token")
     if p == "xero" and not tenant_id:
-        return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=missing_tenant")
-
-    try:
-        _save_provider_creds(
-            email,
-            user,
-            p,
-            access_token=access_token,
-            refresh_token=refresh_token,
-            realm_id=realm_id,
-            tenant_id=tenant_id,
-            account_id=str(fb_account_id or ""),
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=missing_tenant"
         )
-    except Exception:
-        logger.exception("oauth callback %s: failed to persist tokens for %s", p, email)
-        return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=token_persist")
-
-    logger.info("oauth callback %s: tokens stored for %s", p, email)
-    # Tokens never leave the server — frontend only gets connected + entity index.
+    # Audit P0-#1: tokens are persisted against the user and the browser is redirected
+    # back with nothing but a "connected" flag. Previously the access token — and the
+    # Xero refresh token — travelled in this redirect URL, which put a live credential
+    # to the customer's books into the address bar, browser history, and localStorage.
+    _integration_creds_save(
+        email,
+        p,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        realm_id=realm_id,
+        tenant_id=tenant_id,
+        account_id=str(fb_account_id or ""),
+    )
     return RedirectResponse(
-        url=f"{FRONTEND_URL}/calculate-tax?{p}=connected&entity={quote(str(entity_idx))}"
+        url=f"{FRONTEND_URL}/calculate-tax?{p}=connected&entity={entity_idx}"
     )
 
 
-@app.get("/integrations/status")
-def integrations_status(request: Request):
-    email = _require_session_user(request)
-    user = ddb_get_user(email) or {}
-    out = {}
-    for provider in ALLOWED_PROVIDERS:
-        connected = _provider_connected(user, provider)
-        entry = ((user.get("integrations") or {}).get(provider) or {}) if connected else {}
-        out[provider] = {
-            "connected": connected,
-            "connected_at": entry.get("connected_at"),
-        }
-    return out
-
-
-@app.post("/integrations/{p}/disconnect")
-def integrations_disconnect(p: str, request: Request):
-    if p not in ALLOWED_PROVIDERS:
-        raise HTTPException(404)
-    email = _require_session_user(request)
-    user = ddb_get_user(email)
-    if not user:
-        raise HTTPException(401, "Not authenticated")
-    _clear_provider_creds(email, user, p)
-    return {"ok": True, "provider": p}
-
-
 @app.get("/integrations/{p}/data")
-def integration_data(p: str, request: Request, year: str = ""):
+def integration_data(request: Request, p: str, year: str = ""):
+    """Return the connected provider's P&L for `year`.
+
+    Audit P0-#1: this route was previously UNAUTHENTICATED and took the provider access
+    token — and the Xero refresh token — as URL query parameters, which made it an open
+    proxy into any customer's accounting system for anyone holding a leaked token. It
+    now requires a session and loads the credentials from that user's own record, so no
+    token appears in a URL, an access log, or the browser.
+    """
     if p not in ALLOWED_PROVIDERS:
         raise HTTPException(404)
     email = _require_session_user(request)
-    user = ddb_get_user(email) or {}
-    creds = _load_provider_creds(user, p)
-    if not creds or not creds.get("access_token"):
+    creds = _integration_creds_get(email, p)
+    token = creds.get("access_token", "")
+    if not token:
+        # Natasha launch fix: do not dress missing credentials up as HTTP 200.
         raise HTTPException(401, "missing token")
-    token = creds["access_token"]
-    refresh_token = creds.get("refresh_token") or ""
-    realm = creds.get("realm_id") or ""
-    tenant = creds.get("tenant_id") or ""
-    account = creds.get("account_id") or ""
+    realm = creds.get("realm_id", "")
+    tenant = creds.get("tenant_id", "")
+    account = creds.get("account_id", "")
+    refresh_token = creds.get("refresh_token", "")
     start, end = _pnl_date_range(year)
     try:
         if p == "quickbooks":
@@ -2093,20 +2393,16 @@ def integration_data(p: str, request: Request, year: str = ""):
             access = token
             if refresh_token:
                 refreshed = _xero_refresh_access_token(refresh_token)
-                if refreshed:
-                    access = refreshed
-                    # Persist rotated access token when Xero issues a new one.
-                    try:
-                        _save_provider_creds(
-                            email,
-                            user,
-                            "xero",
-                            access_token=access,
-                            refresh_token=refresh_token,
-                            tenant_id=tenant,
-                        )
-                    except Exception as e:
-                        logger.warning("xero token re-persist failed: %s", e)
+                if refreshed and refreshed.get("access_token"):
+                    access = refreshed["access_token"]
+                    # Xero rotates refresh tokens; store the new pair or the next sync fails.
+                    _integration_creds_save(
+                        email,
+                        "xero",
+                        access_token=access,
+                        refresh_token=refreshed.get("refresh_token") or refresh_token,
+                        tenant_id=tenant,
+                    )
             r = requests.get(
                 "https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss",
                 params={"fromDate": start, "toDate": end, "standardLayout": "true"},
@@ -2211,7 +2507,6 @@ def integration_data(p: str, request: Request, year: str = ""):
         raise HTTPException(500, "Provider request failed")
     raise HTTPException(404)
 
-
 def _require_minimum_plan(request: Request, minimum: str):
     """Session-required plan floor (DynamoDB plan is source of truth)."""
     email = _require_session_user(request)
@@ -2315,7 +2610,7 @@ def forgot_password(r: ForgotReq, request: Request):
         ddb_put_user(email, x)
         try:
             reset_url = f"{FRONTEND_URL}/reset-password?token={reset_tok}&email={quote(email)}"
-            ses = boto3.client("ses", region_name="us-east-1")
+            ses = _mailer()   # AUDIT F-8d: SendGrid, not SES (SES sandbox drops all customer mail)
             ses.send_email(
                 Source=RESET_FROM,
                 Destination={"ToAddresses": [email]},
