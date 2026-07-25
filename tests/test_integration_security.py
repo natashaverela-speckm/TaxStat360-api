@@ -55,15 +55,15 @@ def test_integration_data_requires_authentication(client):
 def test_integration_data_ignores_token_in_query_string(client, main):
     """The pre-fix exploit: pass someone's token in the URL and read their books.
 
-    The parameter is gone, so a caller supplying one is simply an unconnected user.
+    The parameter is gone, so a caller supplying one is simply missing credentials.
     """
     _auth(client, main)
     r = client.get(
         "/integrations/quickbooks/data"
         "?year=2026&token=stolen-access-token&realm=123&refresh_token=stolen-refresh"
     )
-    assert r.status_code == 200
-    assert r.json() == {"error": "not connected"}
+    assert r.status_code == 401
+    assert r.json()["detail"] == "missing token"
 
 
 def test_integration_data_reads_credentials_from_the_user_record(client, main):

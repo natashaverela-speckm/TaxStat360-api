@@ -2239,6 +2239,25 @@ def integration_disconnect(request: Request, p: str):
     return {"ok": True, "provider": p, "connected": False}
 
 
+def _oauth_authorize_redirect_url(provider, email, entity="0"):
+    o = _oauth_config(provider)
+    state = quote(_make_oauth_state(email, entity))
+    return (
+        f"{o['auth_url']}?client_id={o['client_id']}&redirect_uri={quote(o['redirect'])}"
+        f"&response_type=code&scope={quote(o['scope'])}&state={state}"
+    )
+
+
+@app.get("/integrations/{p}/connect-url")
+def connect_url(request: Request, p: str, entity: str = "0"):
+    """JSON authorize URL for the SPA (Bearer/cookie). Prefer this over /connect
+    so Authorization can be attached before leaving the page."""
+    if p not in ALLOWED_PROVIDERS:
+        raise HTTPException(404)
+    email = _require_session_user(request)
+    return {"url": _oauth_authorize_redirect_url(p, email, entity), "provider": p}
+
+
 @app.get("/integrations/{p}/connect")
 def connect(request: Request, p: str, entity: str = "0"):
     if p not in ALLOWED_PROVIDERS:
@@ -2246,12 +2265,7 @@ def connect(request: Request, p: str, entity: str = "0"):
     # Only a signed-in user may start an OAuth flow: the tokens it yields are stored
     # against their account, so we must know who they are before the round-trip begins.
     email = _require_session_user(request)
-    o = _oauth_config(p)
-    state = quote(_make_oauth_state(email, entity))
-    return RedirectResponse(
-        f"{o['auth_url']}?client_id={o['client_id']}&redirect_uri={quote(o['redirect'])}"
-        f"&response_type=code&scope={quote(o['scope'])}&state={state}"
-    )
+    return RedirectResponse(url=_oauth_authorize_redirect_url(p, email, entity))
 
 
 @app.get("/integrations/{p}/callback")
@@ -2351,7 +2365,8 @@ def integration_data(request: Request, p: str, year: str = ""):
     creds = _integration_creds_get(email, p)
     token = creds.get("access_token", "")
     if not token:
-        return {"error": "not connected"}
+        # Natasha launch fix: do not dress missing credentials up as HTTP 200.
+        raise HTTPException(401, "missing token")
     realm = creds.get("realm_id", "")
     tenant = creds.get("tenant_id", "")
     account = creds.get("account_id", "")
@@ -2360,7 +2375,7 @@ def integration_data(request: Request, p: str, year: str = ""):
     try:
         if p == "quickbooks":
             if not realm:
-                return {"error": "missing realm"}
+                raise HTTPException(400, "missing realm")
             r = requests.get(
                 f"{_quickbooks_api_base()}/v3/company/{realm}/reports/ProfitAndLoss",
                 params=_quickbooks_pl_params(start, end),
@@ -2369,12 +2384,12 @@ def integration_data(request: Request, p: str, year: str = ""):
             )
             if not r.ok:
                 logger.warning("quickbooks profitloss: %s %s", r.status_code, r.text[:300])
-                return {"error": "quickbooks report failed"}
+                raise HTTPException(502, "quickbooks report failed")
             rev, exp, net = _parse_qb_pnl(r.json())
             return _pnl_result(rev, exp, net_profit=net)
         if p == "xero":
             if not tenant:
-                return {"error": "missing tenant"}
+                raise HTTPException(400, "missing tenant")
             access = token
             if refresh_token:
                 refreshed = _xero_refresh_access_token(refresh_token)
@@ -2386,6 +2401,7 @@ def integration_data(request: Request, p: str, year: str = ""):
                         "xero",
                         access_token=access,
                         refresh_token=refreshed.get("refresh_token") or refresh_token,
+                        tenant_id=tenant,
                     )
             r = requests.get(
                 "https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss",
@@ -2399,10 +2415,10 @@ def integration_data(request: Request, p: str, year: str = ""):
             )
             if not r.ok:
                 logger.warning("xero profitloss: %s %s", r.status_code, r.text[:300])
-                return {"error": "xero report failed", "status": r.status_code}
+                raise HTTPException(502, "xero report failed")
             reports = r.json().get("Reports") or []
             if not reports:
-                return {"error": "xero report empty"}
+                raise HTTPException(502, "xero report empty")
             rev, exp, net, summaries = _parse_xero_pnl(reports[0])
             out = _pnl_result(rev, exp, net_profit=net)
             if (
@@ -2466,9 +2482,9 @@ def integration_data(request: Request, p: str, year: str = ""):
                 .get("business_memberships", [{}])[0]
                 .get("business", {})
                 .get("account_id", account)
-            )
+            ) or account
             if not aid:
-                return {"error": "missing freshbooks account"}
+                raise HTTPException(400, "missing freshbooks account")
             r = requests.get(
                 f"https://api.freshbooks.com/accounting/account/{aid}/reports/accounting/profitloss"
                 f"?start_date={start}&end_date={end}",
@@ -2477,7 +2493,7 @@ def integration_data(request: Request, p: str, year: str = ""):
             )
             if not r.ok:
                 logger.warning("freshbooks profitloss: %s %s", r.status_code, r.text[:300])
-                return {"error": "freshbooks report failed"}
+                raise HTTPException(502, "freshbooks report failed")
             pl = r.json().get("response", {}).get("result", {}).get("profitloss", {})
             # FreshBooks labels total_income as "Gross Profit" in the P&L report.
             gross = _fb_pl_amount(pl, "total_income", "gross_profit")
@@ -2486,11 +2502,10 @@ def integration_data(request: Request, p: str, year: str = ""):
             return _pnl_result(gross, exp, net_profit=net)
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("integration data provider=%s failed", p)
         raise HTTPException(500, "Provider request failed")
     raise HTTPException(404)
-
 
 def _require_minimum_plan(request: Request, minimum: str):
     """Session-required plan floor (DynamoDB plan is source of truth)."""
