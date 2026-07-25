@@ -27,6 +27,12 @@ def test_verification_status_route_registered(client):
 
 def test_core_routes_registered(client):
     # Sanity controls: prove the app, auth, and routing table are intact.
-    for method, path in (("GET", "/auth/me"), ("GET", "/records")):
+    for method, path in (
+        ("GET", "/auth/me"),
+        ("GET", "/records"),
+        ("GET", "/integrations/status"),
+        ("GET", "/integrations/quickbooks/connect-url"),
+        ("POST", "/integrations/quickbooks/disconnect"),
+    ):
         r = client.request(method, path)
         assert r.status_code != 404, f"{method} {path} route is missing (dropped)"

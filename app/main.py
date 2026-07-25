@@ -1800,26 +1800,164 @@ def _exchange_oauth_code(provider, code):
     return r.json()
 
 
-@app.get("/integrations/{p}/connect")
-def connect(p: str, entity: str = "0"):
-    if p not in ALLOWED_PROVIDERS:
-        raise HTTPException(404)
-    o = _oauth_config(p)
-    state = quote(f"ts360|{entity}")
-    return RedirectResponse(
+OAUTH_STATE_TTL = 600
+
+
+def _sign_oauth_state(email, entity_idx="0"):
+    """HMAC state so the callback can bind the token write to a user without
+    putting credentials in the browser redirect URL."""
+    email = _norm_email(email)
+    entity_idx = str(entity_idx if str(entity_idx).isdigit() else "0")
+    ts = str(int(time.time()))
+    payload = f"{email}|{entity_idx}|{ts}"
+    sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{payload}|{sig}"
+
+
+def _verify_oauth_state(state):
+    raw = unquote(state or "")
+    parts = raw.split("|")
+    if len(parts) != 4:
+        return None, "0"
+    email, entity_idx, ts, sig = parts
+    payload = f"{email}|{entity_idx}|{ts}"
+    expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    if not hmac.compare_digest(sig, expected):
+        return None, "0"
+    try:
+        if int(time.time()) - int(ts) > OAUTH_STATE_TTL:
+            return None, "0"
+    except (TypeError, ValueError):
+        return None, "0"
+    return _norm_email(email), (entity_idx if entity_idx.isdigit() else "0")
+
+
+def _provider_connected(user, provider):
+    entry = ((user or {}).get("integrations") or {}).get(provider) or {}
+    return bool(entry.get("access_token_enc"))
+
+
+def _save_provider_creds(
+    email,
+    user,
+    provider,
+    *,
+    access_token,
+    refresh_token="",
+    realm_id="",
+    tenant_id="",
+    account_id="",
+):
+    integ = dict(user.get("integrations") or {})
+    entry = {
+        "access_token_enc": _mfa_encrypt(access_token),
+        "connected_at": int(time.time()),
+    }
+    if refresh_token:
+        entry["refresh_token_enc"] = _mfa_encrypt(refresh_token)
+    if realm_id:
+        entry["realm_id"] = str(realm_id)
+    if tenant_id:
+        entry["tenant_id"] = str(tenant_id)
+    if account_id:
+        entry["account_id"] = str(account_id)
+    integ[provider] = entry
+    user["integrations"] = integ
+    ddb_put_user(email, user)
+
+
+def _clear_provider_creds(email, user, provider):
+    integ = dict(user.get("integrations") or {})
+    if provider in integ:
+        integ.pop(provider, None)
+        user["integrations"] = integ
+        ddb_put_user(email, user)
+
+
+def _load_provider_creds(user, provider):
+    entry = ((user or {}).get("integrations") or {}).get(provider) or {}
+    enc = entry.get("access_token_enc")
+    if not enc:
+        return None
+    try:
+        access = _mfa_decrypt(enc)
+    except Exception as e:
+        logger.warning("integration token decrypt failed provider=%s: %s", provider, e)
+        return None
+    refresh = ""
+    if entry.get("refresh_token_enc"):
+        try:
+            refresh = _mfa_decrypt(entry["refresh_token_enc"])
+        except Exception as e:
+            logger.warning("integration refresh decrypt failed provider=%s: %s", provider, e)
+    return {
+        "access_token": access,
+        "refresh_token": refresh,
+        "realm_id": entry.get("realm_id", "") or "",
+        "tenant_id": entry.get("tenant_id", "") or "",
+        "account_id": entry.get("account_id", "") or "",
+    }
+
+
+def _oauth_authorize_url(provider, email, entity_idx="0"):
+    o = _oauth_config(provider)
+    state = _sign_oauth_state(email, entity_idx)
+    return (
         f"{o['auth_url']}?client_id={o['client_id']}&redirect_uri={quote(o['redirect'])}"
-        f"&response_type=code&scope={quote(o['scope'])}&state={state}"
+        f"&response_type=code&scope={quote(o['scope'])}&state={quote(state)}"
     )
 
 
+@app.get("/integrations/{p}/connect-url")
+def connect_url(p: str, request: Request, entity: str = "0"):
+    """Return the provider authorize URL (Bearer/cookie auth). Preferred over
+    /connect so the SPA can attach Authorization before leaving the page."""
+    if p not in ALLOWED_PROVIDERS:
+        raise HTTPException(404)
+    email = _require_session_user(request)
+    return {"url": _oauth_authorize_url(p, email, entity), "provider": p}
+
+
+@app.get("/integrations/{p}/connect")
+def connect(p: str, request: Request, entity: str = "0"):
+    if p not in ALLOWED_PROVIDERS:
+        raise HTTPException(404)
+    email = _session_email(request)
+    if not email:
+        return RedirectResponse(url=f"{FRONTEND_URL}/login?next=/calculate-tax")
+    return RedirectResponse(url=_oauth_authorize_url(p, email, entity))
+
+
 @app.get("/integrations/{p}/callback")
-def callback(p: str, code: str = "", state: str = "", realmId: str = "", tenantId: str = ""):
+def callback(
+    p: str,
+    request: Request,
+    code: str = "",
+    state: str = "",
+    realmId: str = "",
+    tenantId: str = "",
+):
     if p not in ALLOWED_PROVIDERS:
         raise HTTPException(404)
     if not code:
+        logger.warning("oauth callback %s missing authorization code", p)
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=missing_code")
-    parts = unquote(state or "").split("|")
-    entity_idx = parts[-1] if len(parts) > 1 and parts[-1].isdigit() else "0"
+
+    email, entity_idx = _verify_oauth_state(state)
+    if not email:
+        # Fallback: session cookie on the API host (same OAuth return).
+        email = _session_email(request)
+        parts = unquote(state or "").split("|")
+        entity_idx = parts[1] if len(parts) > 1 and parts[1].isdigit() else "0"
+    if not email:
+        logger.warning("oauth callback %s: no verified state and no session", p)
+        return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=not_authenticated")
+
+    user = ddb_get_user(email)
+    if not user:
+        logger.warning("oauth callback %s: user missing email=%s", p, email)
+        return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=user_missing")
+
     access_token = ""
     refresh_token = ""
     realm_id = realmId or ""
@@ -1861,49 +1999,83 @@ def callback(p: str, code: str = "", state: str = "", realmId: str = "", tenantI
                 )
     except HTTPException:
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=token_exchange")
-    except Exception as e:
+    except Exception:
         logger.exception("oauth callback %s failed", p)
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=token_exchange")
+
     if not access_token:
         return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=no_token")
-    params = [f"{p}=connected", f"entity={entity_idx}", f"{p}_token={quote(access_token)}"]
-    if p == "quickbooks":
-        params.append(f"qb_token={quote(access_token)}")
-        if realm_id:
-            params.append(f"realm={quote(realm_id)}")
-    elif p == "xero":
-        if not tenant_id:
-            return RedirectResponse(
-                url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=missing_tenant"
-            )
-        params.append(f"tenant={quote(tenant_id)}")
-        if refresh_token:
-            params.append(f"xero_refresh={quote(refresh_token)}")
-    elif p == "freshbooks" and fb_account_id:
-        params.append(f"account={quote(str(fb_account_id))}")
-        params.append(f"fb_token={quote(access_token)}")
-    return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?" + "&".join(params))
+    if p == "xero" and not tenant_id:
+        return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=missing_tenant")
+
+    try:
+        _save_provider_creds(
+            email,
+            user,
+            p,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            realm_id=realm_id,
+            tenant_id=tenant_id,
+            account_id=str(fb_account_id or ""),
+        )
+    except Exception:
+        logger.exception("oauth callback %s: failed to persist tokens for %s", p, email)
+        return RedirectResponse(url=f"{FRONTEND_URL}/calculate-tax?{p}=error&reason=token_persist")
+
+    logger.info("oauth callback %s: tokens stored for %s", p, email)
+    # Tokens never leave the server — frontend only gets connected + entity index.
+    return RedirectResponse(
+        url=f"{FRONTEND_URL}/calculate-tax?{p}=connected&entity={quote(str(entity_idx))}"
+    )
+
+
+@app.get("/integrations/status")
+def integrations_status(request: Request):
+    email = _require_session_user(request)
+    user = ddb_get_user(email) or {}
+    out = {}
+    for provider in ALLOWED_PROVIDERS:
+        connected = _provider_connected(user, provider)
+        entry = ((user.get("integrations") or {}).get(provider) or {}) if connected else {}
+        out[provider] = {
+            "connected": connected,
+            "connected_at": entry.get("connected_at"),
+        }
+    return out
+
+
+@app.post("/integrations/{p}/disconnect")
+def integrations_disconnect(p: str, request: Request):
+    if p not in ALLOWED_PROVIDERS:
+        raise HTTPException(404)
+    email = _require_session_user(request)
+    user = ddb_get_user(email)
+    if not user:
+        raise HTTPException(401, "Not authenticated")
+    _clear_provider_creds(email, user, p)
+    return {"ok": True, "provider": p}
 
 
 @app.get("/integrations/{p}/data")
-def integration_data(
-    p: str,
-    token: str = "",
-    realm: str = "",
-    tenant: str = "",
-    account: str = "",
-    year: str = "",
-    refresh_token: str = "",
-):
+def integration_data(p: str, request: Request, year: str = ""):
     if p not in ALLOWED_PROVIDERS:
         raise HTTPException(404)
-    if not token:
-        return {"error": "missing token"}
+    email = _require_session_user(request)
+    user = ddb_get_user(email) or {}
+    creds = _load_provider_creds(user, p)
+    if not creds or not creds.get("access_token"):
+        raise HTTPException(401, "missing token")
+    token = creds["access_token"]
+    refresh_token = creds.get("refresh_token") or ""
+    realm = creds.get("realm_id") or ""
+    tenant = creds.get("tenant_id") or ""
+    account = creds.get("account_id") or ""
     start, end = _pnl_date_range(year)
     try:
         if p == "quickbooks":
             if not realm:
-                return {"error": "missing realm"}
+                raise HTTPException(400, "missing realm")
             r = requests.get(
                 f"{_quickbooks_api_base()}/v3/company/{realm}/reports/ProfitAndLoss",
                 params=_quickbooks_pl_params(start, end),
@@ -1912,17 +2084,29 @@ def integration_data(
             )
             if not r.ok:
                 logger.warning("quickbooks profitloss: %s %s", r.status_code, r.text[:300])
-                return {"error": "quickbooks report failed"}
+                raise HTTPException(502, "quickbooks report failed")
             rev, exp, net = _parse_qb_pnl(r.json())
             return _pnl_result(rev, exp, net_profit=net)
         if p == "xero":
             if not tenant:
-                return {"error": "missing tenant"}
+                raise HTTPException(400, "missing tenant")
             access = token
             if refresh_token:
                 refreshed = _xero_refresh_access_token(refresh_token)
                 if refreshed:
                     access = refreshed
+                    # Persist rotated access token when Xero issues a new one.
+                    try:
+                        _save_provider_creds(
+                            email,
+                            user,
+                            "xero",
+                            access_token=access,
+                            refresh_token=refresh_token,
+                            tenant_id=tenant,
+                        )
+                    except Exception as e:
+                        logger.warning("xero token re-persist failed: %s", e)
             r = requests.get(
                 "https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss",
                 params={"fromDate": start, "toDate": end, "standardLayout": "true"},
@@ -1935,10 +2119,10 @@ def integration_data(
             )
             if not r.ok:
                 logger.warning("xero profitloss: %s %s", r.status_code, r.text[:300])
-                return {"error": "xero report failed", "status": r.status_code}
+                raise HTTPException(502, "xero report failed")
             reports = r.json().get("Reports") or []
             if not reports:
-                return {"error": "xero report empty"}
+                raise HTTPException(502, "xero report empty")
             rev, exp, net, summaries = _parse_xero_pnl(reports[0])
             out = _pnl_result(rev, exp, net_profit=net)
             if (
@@ -2002,9 +2186,9 @@ def integration_data(
                 .get("business_memberships", [{}])[0]
                 .get("business", {})
                 .get("account_id", account)
-            )
+            ) or account
             if not aid:
-                return {"error": "missing freshbooks account"}
+                raise HTTPException(400, "missing freshbooks account")
             r = requests.get(
                 f"https://api.freshbooks.com/accounting/account/{aid}/reports/accounting/profitloss"
                 f"?start_date={start}&end_date={end}",
@@ -2013,7 +2197,7 @@ def integration_data(
             )
             if not r.ok:
                 logger.warning("freshbooks profitloss: %s %s", r.status_code, r.text[:300])
-                return {"error": "freshbooks report failed"}
+                raise HTTPException(502, "freshbooks report failed")
             pl = r.json().get("response", {}).get("result", {}).get("profitloss", {})
             # FreshBooks labels total_income as "Gross Profit" in the P&L report.
             gross = _fb_pl_amount(pl, "total_income", "gross_profit")
@@ -2022,7 +2206,7 @@ def integration_data(
             return _pnl_result(gross, exp, net_profit=net)
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("integration data provider=%s failed", p)
         raise HTTPException(500, "Provider request failed")
     raise HTTPException(404)

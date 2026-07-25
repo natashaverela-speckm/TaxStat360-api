@@ -91,19 +91,33 @@ def test_webhook_invalid_signature_generic_message(client):
     assert "bad sig" not in r.json()["detail"]
 
 
-def test_oauth_connect_requires_env_client_id(client, monkeypatch):
+def test_oauth_connect_requires_env_client_id(client, main, monkeypatch):
+    email = "oauth-cfg@example.com"
+    _mk_user(main, email)
+    _auth(client, main, email)
     monkeypatch.delenv("QUICKBOOKS_CLIENT_ID", raising=False)
+    # Force empty client id even if process env was set before import.
+    monkeypatch.setenv("QUICKBOOKS_CLIENT_ID", "")
     r = client.get("/integrations/quickbooks/connect", follow_redirects=False)
     assert r.status_code == 503
     assert "not configured" in r.json()["detail"].lower()
 
 
-def test_oauth_connect_uses_env_client_id(client):
+def test_oauth_connect_uses_env_client_id(client, main):
+    email = "oauth-ok@example.com"
+    _mk_user(main, email)
+    _auth(client, main, email)
     r = client.get("/integrations/quickbooks/connect", follow_redirects=False)
     assert r.status_code in (302, 307)
     loc = r.headers.get("location", "")
     assert "client_id=qb-test-client-id" in loc
     assert "AB1FhVS3wJV2oOLUXNS8ZlnCHuUFW3XTM20rOydbCln0Pj1vZG" not in loc
+
+
+def test_oauth_connect_unauthenticated_redirects_login(client):
+    r = client.get("/integrations/quickbooks/connect", follow_redirects=False)
+    assert r.status_code in (302, 307)
+    assert "/login" in r.headers.get("location", "")
 
 
 def test_audit_write_failure_does_not_leak_exception_text(main, monkeypatch):
