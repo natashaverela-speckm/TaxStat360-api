@@ -1,7 +1,18 @@
 """Phase 2 (F7/F8) — error-handling and OAuth env characterization tests."""
 from unittest.mock import patch
 
+import pytest
 import stripe
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limit(main):
+    # /stripe/subscribe picked up a rate limit in the M-1 fix (fresh-pass audit,
+    # Aug 2026); this file calls it more than once, so it needs the same
+    # per-file reset every other rate-limited-route test file already uses.
+    main.limiter.reset()
+    yield
+    main.limiter.reset()
 
 
 def _mk_user(main, email):
@@ -23,11 +34,38 @@ def _auth(client, main, email):
 
 
 def test_subscribe_missing_user_returns_404_not_400(client, main):
-    """HTTPException(404) must not be swallowed by a broad except -> 400."""
+    """HTTPException(404) must not be swallowed by a broad except -> 400.
+
+    M-2 FIX (fresh-pass audit, Aug 2026): /stripe/subscribe used to look its
+    user up via load()/full-table-scan; it now uses the same O(1)
+    ddb_get_user(email) every other authenticated route uses. That also means
+    -- as a side effect of the H-1 session_epoch fix -- an authenticated
+    session now requires the underlying user record to still exist (verified
+    fresh on every request), so "authenticated but the user vanished" can only
+    happen via a genuine race: the record existed when the session was
+    verified, then disappeared before this route's own lookup. Modeled here
+    with a call-counted ddb_get_user that returns the real record on the first
+    call (auth) and None on the second (the route's own lookup) -- exercising
+    the same defensive 404 branch the original test targeted.
+    """
     email = "missing-user-404@test.com"
     _mk_user(main, email)
     _auth(client, main, email)
-    with patch("app.main.load", return_value={}):
+    # Auth alone makes two ddb_get_user calls before the route body ever runs:
+    # one inside _verify_session (H-1's epoch check) and one inside
+    # _require_session_user's pre-existing ddb_user_exists check. Both need the
+    # real record so auth succeeds; only the route's OWN lookup (the 3rd call)
+    # should observe the "vanished" user and produce the 404 under test.
+    real_get_user = main.ddb_get_user
+    calls = {"n": 0}
+
+    def _flaky_get_user(e):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return real_get_user(e)
+        return None
+
+    with patch("app.main.ddb_get_user", side_effect=_flaky_get_user):
         r = client.post(
             "/stripe/subscribe",
             json={
