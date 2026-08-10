@@ -168,6 +168,29 @@ def _norm_email(email):
     return (email or "").strip().lower()
 
 
+def _client_ip(request):
+    """Best-effort client IP for forensic/audit fields only — never for access control.
+
+    SECURITY FIX (fresh-pass audit, Aug 2026): previously took X-Forwarded-For
+    as-is. That header is client-supplied and trivially spoofable (a client can
+    send "X-Forwarded-For: 1.2.3.4" and have it recorded verbatim). The format
+    is a comma-separated hop chain — "client, proxy1, proxy2, ..." — where each
+    hop APPENDS the address it received the request from. Behind exactly one
+    trusted reverse proxy (the normal single-hop setup: an ALB, CloudFront, or
+    nginx in front of this app), the LAST entry in that chain is the one the
+    trusted proxy itself observed and appended, so it can't have been forged by
+    the client — everything before it can be. Falls back to the raw socket
+    address when the header is absent. This is still advisory data for the
+    audit trail, not a security control; nothing in this app gates access on it.
+    """
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        last_hop = xff.split(",")[-1].strip()
+        if last_hop:
+            return last_hop
+    return request.client.host if request.client else ""
+
+
 def _hash_password(password):
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
@@ -1231,6 +1254,12 @@ def _send_trial_confirmation_email(email, name, plan, billing):
 @limiter.limit("3/minute")
 def register(r: Reg, request: Request):
     email = _norm_email(r.email)
+    # SECURITY FIX (fresh-pass audit, Aug 2026): /auth/reset-password has always
+    # enforced a 12-128 character password length, but /auth/register never did —
+    # any password, including a 1-character one, was accepted at signup. Applying
+    # the same rule here closes that gap without changing the reset-password path.
+    if not (12 <= len(r.password) <= 128):
+        raise HTTPException(400, "Password must be between 12 and 128 characters")
     if ddb_user_exists(email):
         raise HTTPException(400, "Email already registered")
     plan = r.plan if r.plan in VALID_PLANS else "starter"
@@ -1314,6 +1343,13 @@ def mfa_setup(request: Request):
 
 
 @app.post("/auth/mfa/verify")
+# SECURITY FIX (fresh-pass audit, Aug 2026): this checks a 6-digit TOTP code
+# for an already-authenticated session with no throttling — an attacker who
+# has stolen a session cookie/token could brute-force the code (1,000,000
+# combinations) with no rate limit in the way. /auth/mfa/challenge (the
+# equivalent check during login, before a session exists) already limits to
+# 10/minute; applying the same limit here closes the same gap post-login.
+@limiter.limit("10/minute")
 def mfa_verify(r: MfaCodeReq, request: Request):
     email = _require_session_user(request)
     x = ddb_get_user(email)
@@ -1332,6 +1368,10 @@ def mfa_verify(r: MfaCodeReq, request: Request):
 
 
 @app.post("/auth/mfa/disable")
+# SECURITY FIX (fresh-pass audit, Aug 2026): same brute-force gap as
+# mfa_verify above — disabling MFA also only requires a 6-digit TOTP code
+# with no throttling. Same 10/minute limit as mfa_verify / mfa_challenge.
+@limiter.limit("10/minute")
 def mfa_disable(r: MfaCodeReq, request: Request):
     email = _require_session_user(request)
     x = ddb_get_user(email)
@@ -1541,7 +1581,7 @@ async def upsert_record(request: Request):
     # to reconstruct the event from access logs.
     raw_session = request.cookies.get(SESSION_COOKIE, "")
     item["writtenBySession"] = raw_session[:16] if raw_session else ""
-    item["writtenByIp"] = request.headers.get("x-forwarded-for", request.client.host if request.client else "")
+    item["writtenByIp"] = _client_ip(request)
     item["writtenAt"] = now
     _records_tbl.put_item(Item=_to_ddb(item))
     return _record_from_item(item)
@@ -2763,6 +2803,17 @@ async def stripe_webhook(request: Request):
     import json as _json
 
     try:
+        # CORRECTION (fresh-pass audit, Aug 2026): a first pass at this file
+        # called this `if WEBHOOK_SECRET:` guard dead code, since
+        # _resolve_webhook_secret() now fails closed at startup and
+        # WEBHOOK_SECRET can never be empty in production. That's true at
+        # runtime, but the guard is NOT dead: tests/test_stripe_webhook.py
+        # deliberately does `monkeypatch.setattr(main, "WEBHOOK_SECRET", "")`
+        # as a documented, intentional way to skip Stripe signature
+        # verification for webhook-processing tests that aren't testing
+        # signature verification itself (see that file's module docstring).
+        # Removing the guard broke six passing tests. Restored as-is — this
+        # is a real, load-bearing test seam, not leftover dead code.
         if WEBHOOK_SECRET:
             # Verify the signature (raises on tampering / mismatch). We deliberately
             # do NOT use its return value for processing: stripe.Webhook.construct_event
