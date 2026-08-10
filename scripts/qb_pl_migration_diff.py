@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT))
 def _bootstrap_env() -> None:
     """app.main requires Stripe + table env at import; use dummies for this CLI tool."""
     os.environ.setdefault("STRIPE_SECRET_KEY", "sk_test_dummy")
+    os.environ.setdefault("STRIPE_WEBHOOK_SECRET", "whsec_local_diff_script")
     os.environ.setdefault("SECRET_KEY", "local-diff-script")
     os.environ.setdefault("USERS_TABLE", "taxstat360-users")
     os.environ.setdefault("RECORDS_TABLE", "taxstat360-records")
