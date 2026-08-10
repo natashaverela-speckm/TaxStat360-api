@@ -120,4 +120,12 @@ def main():
 def client(main):
     from fastapi.testclient import TestClient
 
-    return TestClient(main.app)
+    # SECURITY FIX (fresh-pass audit, Aug 2026): the new CSRF-origin-check
+    # middleware (main.py, _csrf_origin_check) rejects any cookie-authenticated
+    # mutating request whose Origin/Referer doesn't match an allowed origin --
+    # exactly what a real cross-site attacker's request would look like. A real
+    # browser hitting this API always sends Origin, so the test client sets the
+    # same default header a legitimate frontend request would carry. Tests that
+    # specifically want to exercise the CSRF rejection path override this with
+    # headers={"origin": ""} (or an unrelated origin) on the individual call.
+    return TestClient(main.app, headers={"origin": "https://www.taxstat360.com"})
