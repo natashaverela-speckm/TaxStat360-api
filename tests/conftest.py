@@ -10,6 +10,7 @@ import os
 os.environ.update(
     {
         "STRIPE_SECRET_KEY": "sk_test_dummy",
+        "STRIPE_WEBHOOK_SECRET": "whsec_test_dummy",
         "SECRET_KEY": "test-secret",
         "USERS_TABLE": "test-users",
         "RECORDS_TABLE": "test-records",

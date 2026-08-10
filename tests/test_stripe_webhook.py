@@ -1,4 +1,14 @@
-"""Stripe webhook — always 200 after verify, direct customer lookup (no full-table scan)."""
+"""Stripe webhook — always 200 after verify, direct customer lookup (no full-table scan).
+
+SECURITY FIX (independent review, Aug 2026): the tests below use
+monkeypatch.setattr(main, "WEBHOOK_SECRET", "") as a TEST-ONLY convenience to
+exercise the unverified-payload code path without a real Stripe signature.
+That is safe here because it patches the already-resolved module attribute
+directly; it says nothing about production behavior. Production behavior is
+covered separately by the test_missing_webhook_secret_* tests, which call
+main._resolve_webhook_secret() — the function actually used to populate
+WEBHOOK_SECRET at import time — and confirm it raises outside dev/test/local.
+"""
 import json
 from unittest.mock import patch
 
@@ -157,3 +167,39 @@ def test_invoice_payment_failed_returns_200(client, main, monkeypatch):
         r = client.post("/stripe/webhook", content=json.dumps(event))
         scan.assert_not_called()
     assert r.status_code == 200
+
+
+# ─── Fail-closed webhook secret (security fix, Aug 2026) ─────────────────────
+# Regression guard for the fix itself: a missing STRIPE_WEBHOOK_SECRET must
+# block startup instead of silently disabling signature verification (the
+# original vulnerability — see the module comment above `_resolve_webhook_secret`
+# in app/main.py). Unconditional, same as the existing STRIPE_SECRET_KEY check:
+# no environment-based carve-out, so there's no APP_ENV misconfiguration that
+# could leave this permissive in production. The test harness (conftest.py)
+# supplies a dummy STRIPE_WEBHOOK_SECRET up front, same as it already does for
+# STRIPE_SECRET_KEY, so importing app.main in tests works unchanged.
+
+
+def test_missing_webhook_secret_raises(main, monkeypatch):
+    monkeypatch.delenv("STRIPE_WEBHOOK_SECRET", raising=False)
+    with pytest.raises(RuntimeError, match="STRIPE_WEBHOOK_SECRET"):
+        main._resolve_webhook_secret()
+
+
+def test_blank_webhook_secret_raises(main, monkeypatch):
+    monkeypatch.setenv("STRIPE_WEBHOOK_SECRET", "")
+    with pytest.raises(RuntimeError, match="STRIPE_WEBHOOK_SECRET"):
+        main._resolve_webhook_secret()
+
+
+def test_present_webhook_secret_is_returned(main, monkeypatch):
+    monkeypatch.setenv("STRIPE_WEBHOOK_SECRET", "whsec_present")
+    assert main._resolve_webhook_secret() == "whsec_present"
+
+
+def test_module_level_webhook_secret_matches_test_harness_value(main):
+    """conftest.py sets STRIPE_WEBHOOK_SECRET before app.main is imported, so
+    the module-level WEBHOOK_SECRET populated at import time should reflect it
+    — confirms the fail-closed check runs at import, not just when called
+    directly, and that the test harness genuinely exercises the guarded path."""
+    assert main.WEBHOOK_SECRET == "whsec_test_dummy"
