@@ -111,7 +111,32 @@ USERS_STRIPE_CUSTOMER_GSI = os.environ.get(
 )
 SESSION_COOKIE = "ts360_session"
 SESSION_MAX_AGE = 7 * 24 * 3600
-SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-in-env")
+
+
+def _resolve_secret_key():
+    """Resolve SECRET_KEY, failing closed unconditionally.
+
+    SECURITY FIX (independent review, Aug 2026): SECRET_KEY signs every session
+    cookie (_make_session/_verify_session below) and derives the Fernet key that
+    encrypts MFA/TOTP secrets (_mfa_fernet). It previously fell back to the
+    hardcoded literal "change-me-in-env" — a value visible to anyone who reads
+    this public-facing source file. If the real env var were ever missing
+    (deploy misconfiguration, a wiped .env, a typo'd key name), the app would
+    start normally but sign every session with that known literal: anyone could
+    forge a valid ts360_session cookie for any email address, and anyone who
+    had already enabled MFA would have a decryptable-by-anyone TOTP secret.
+    Mirrors the STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET checks elsewhere in
+    this file: fail closed, always, no environment-based carve-out. Local/dev/
+    test setups already supply their own value (see tests/conftest.py and
+    scripts/qb_pl_migration_diff.py), same as those two keys require today.
+    """
+    key = os.environ.get("SECRET_KEY", "")
+    if not key:
+        raise RuntimeError("SECRET_KEY environment variable not set")
+    return key
+
+
+SECRET_KEY = _resolve_secret_key()
 # Share session cookie across www/app subdomains; empty in tests/local.
 SESSION_COOKIE_DOMAIN = os.environ.get("SESSION_COOKIE_DOMAIN", ".taxstat360.com")
 
@@ -2662,7 +2687,29 @@ def reset_password(r: ResetReq, request: Request):
     return {"ok": True}
 
 
-WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+def _resolve_webhook_secret():
+    """Resolve STRIPE_WEBHOOK_SECRET, failing closed unconditionally.
+
+    SECURITY FIX (independent review, Aug 2026): Stripe's signature is the ONLY
+    authentication /stripe/webhook has — it can't carry a session cookie or
+    bearer token, since Stripe calls it directly. The endpoint previously did
+    `if WEBHOOK_SECRET: verify(...)`, so a missing, mistyped, or not-yet-rotated
+    STRIPE_WEBHOOK_SECRET in production silently disabled verification instead
+    of blocking startup — anyone could then POST an arbitrary JSON body claiming
+    to be e.g. customer.subscription.updated for a known Stripe customer id and
+    upgrade that account to a paid plan for free (or cancel one). This mirrors
+    the STRIPE_SECRET_KEY check a few lines above in this file: fail closed,
+    always, with no environment-based carve-out — exactly like that key,
+    local/dev/test setups are expected to supply a real (test-mode) value via
+    .env / the test harness, same as STRIPE_SECRET_KEY already requires today.
+    """
+    secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+    if not secret:
+        raise RuntimeError("STRIPE_WEBHOOK_SECRET environment variable not set")
+    return secret
+
+
+WEBHOOK_SECRET = _resolve_webhook_secret()
 
 
 def _process_stripe_webhook_event(event):
