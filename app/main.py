@@ -461,7 +461,13 @@ def _make_session(email):
 
 
 def _verify_session(token):
+    # AUTH-1 DIAGNOSTIC (Audit Synthesis, Aug 2026): every return path below now logs
+    # WHY verification failed, tagged with a short, non-reversible fingerprint of the
+    # token (not the token itself, not the signing key) so repeated failures for the
+    # SAME cookie can be correlated across log lines without exposing the credential.
+    fp = hashlib.sha256(token.encode()).hexdigest()[:12] if token else "none"
     if not token:
+        logger.info("AUTH1 verify_session fp=%s result=fail reason=no_token", fp)
         return None
     try:
         import base64 as _b64
@@ -469,6 +475,7 @@ def _verify_session(token):
         payload, sig = raw.rsplit(":", 1)
         expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected):
+            logger.info("AUTH1 verify_session fp=%s result=fail reason=bad_signature", fp)
             return None
         parts = payload.split(":")
         if len(parts) == 4:
@@ -483,28 +490,57 @@ def _verify_session(token):
             email, ts, _nonce = parts
             token_epoch = 0
         else:
+            logger.info("AUTH1 verify_session fp=%s result=fail reason=bad_format parts=%d", fp, len(parts))
             return None
-        if int(time.time()) - int(ts) > SESSION_MAX_AGE:
+        age = int(time.time()) - int(ts)
+        if age > SESSION_MAX_AGE:
+            logger.info("AUTH1 verify_session fp=%s result=fail reason=expired age_s=%d max_s=%d", fp, age, SESSION_MAX_AGE)
             return None
         email = _norm_email(email)
         rec = ddb_get_user(email)
         if not rec:
+            logger.info("AUTH1 verify_session fp=%s result=fail reason=user_not_found email=%s", fp, email)
             return None
         current_epoch = int(rec.get("session_epoch", 0) or 0)
         if token_epoch != current_epoch:
+            logger.info(
+                "AUTH1 verify_session fp=%s result=fail reason=epoch_mismatch email=%s token_epoch=%d current_epoch=%d",
+                fp, email, token_epoch, current_epoch,
+            )
             return None
+        logger.info("AUTH1 verify_session fp=%s result=ok email=%s", fp, email)
         return email
-    except Exception:
+    except Exception as e:
+        logger.info("AUTH1 verify_session fp=%s result=fail reason=exception detail=%s", fp, e)
         return None
 
 
 def _session_email(request):
-    email = _verify_session(request.cookies.get(SESSION_COOKIE, ""))
-    if email:
-        return email
+    # AUTH-1 DIAGNOSTIC (Audit Synthesis, Aug 2026): records which credential source
+    # was present on this request and which one (if either) resolved -- this is the
+    # single call site both /auth/me and every other authenticated route go through,
+    # so it's the one place to look to answer "did the browser even SEND the cookie."
+    cookie_val = request.cookies.get(SESSION_COOKIE, "")
     auth = request.headers.get("authorization", "")
-    if auth.lower().startswith("bearer "):
-        return _verify_session(auth[7:].strip())
+    has_bearer = auth.lower().startswith("bearer ")
+    email = _verify_session(cookie_val)
+    if email:
+        logger.info(
+            "AUTH1 session_email path=%s source=cookie result=ok had_cookie=%s had_bearer=%s",
+            request.url.path, bool(cookie_val), has_bearer,
+        )
+        return email
+    if has_bearer:
+        email = _verify_session(auth[7:].strip())
+        logger.info(
+            "AUTH1 session_email path=%s source=bearer result=%s had_cookie=%s",
+            request.url.path, "ok" if email else "fail", bool(cookie_val),
+        )
+        return email
+    logger.info(
+        "AUTH1 session_email path=%s source=none result=fail had_cookie=%s had_bearer=%s",
+        request.url.path, bool(cookie_val), has_bearer,
+    )
     return None
 
 
@@ -522,6 +558,16 @@ def _set_session_cookie(response, email, session_value=None):
     if SESSION_COOKIE_DOMAIN:
         kwargs["domain"] = SESSION_COOKIE_DOMAIN
     response.set_cookie(**kwargs)
+    # AUTH-1 DIAGNOSTIC (Audit Synthesis, Aug 2026): confirms, from inside the app,
+    # that the Set-Cookie call actually ran and with what attributes -- so if a user
+    # still can't stay logged in, we can rule the app OUT (or IN) by checking whether
+    # this line fired for their login. Logs email + cookie attributes only, never the
+    # token value itself.
+    logger.info(
+        "AUTH1 set_session_cookie email=%s domain=%s samesite=%s secure=%s max_age=%s",
+        _norm_email(email), kwargs.get("domain", "<unset>"), kwargs["samesite"],
+        kwargs["secure"], kwargs["max_age"],
+    )
 
 
 def _clear_session_cookie(response):
