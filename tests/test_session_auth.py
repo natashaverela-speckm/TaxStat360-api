@@ -79,3 +79,32 @@ def test_secret_key_no_longer_falls_back_to_known_literal(main):
     """The old insecure default must not still be reachable anywhere a real
     key was expected — pins the fix so it can't silently regress."""
     assert main.SECRET_KEY != "change-me-in-env"
+
+
+# ─── AUTH-SESSION hardening (Phase 1, Audit Synthesis, Aug 2026) ──────────────
+# Regression guard: ddb_get_user() must request a strongly-consistent read.
+# See the comment on ddb_get_user in app/main.py for why -- an eventually-
+# consistent read immediately after a write is the leading hypothesis for the
+# intermittent "login succeeds, the very next /auth/me returns 401" bug
+# tracked as KNOWN_LIMITATIONS.md "AUTH-SESSION". This test doesn't (and
+# can't, against moto) prove that bug is fixed -- it pins the one concrete,
+# verifiable code change this pass made: every read through ddb_get_user asks
+# DynamoDB for a consistent read, not an eventually-consistent one.
+def test_ddb_get_user_requests_consistent_read(main, monkeypatch):
+    email = "consistent-read@example.com"
+    main.ddb_put_user(email, {"name": "CR Test", "pw": main._hash_password("x"), "plan": "starter"})
+
+    calls = []
+    real_get_item = main._users_tbl.get_item
+
+    def spy_get_item(*args, **kwargs):
+        calls.append(kwargs)
+        return real_get_item(*args, **kwargs)
+
+    monkeypatch.setattr(main._users_tbl, "get_item", spy_get_item)
+
+    result = main.ddb_get_user(email)
+
+    assert result is not None
+    assert len(calls) == 1
+    assert calls[0].get("ConsistentRead") is True
