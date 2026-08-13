@@ -936,7 +936,14 @@ def _perform_account_deletion(target_email, actor_email, ip=""):
             type(e).__name__,
         )
         _write_audit("account.delete", actor_email, target_email, "failed", detail=str(e), ip=ip)
-        raise HTTPException(502, f"Account deletion failed before completion: {e}")
+        # AUDIT FIX (fresh-eyes re-audit, Aug 2026): the raw exception string (could
+        # include internal DynamoDB/Stripe error text) was going straight into the
+        # response body. Every other error path in this file returns a generic
+        # client-safe message and logs detail server-side instead (see logger.exception
+        # and _write_audit above, both of which already capture the real detail) --
+        # this path did not get that treatment. Generic message only, detail stays
+        # server-side.
+        raise HTTPException(502, "Account deletion failed before completion. Support has been notified; please try again or contact support@taxstat360.com.")
 
 
 # --- M3 MFA (TOTP + encrypted backup codes) ---
@@ -2690,9 +2697,17 @@ def integration_data(request: Request, p: str, year: str = ""):
                 and (net is None or net == 0)
                 and summaries
             ):
-                out["debug_labels"] = [
-                    k for k in summaries.keys() if "::" not in k
-                ][:20]
+                # AUDIT FIX (fresh-eyes re-audit, Aug 2026): this diagnostic aid (Xero
+                # report section labels, for troubleshooting a zero-parse) was being
+                # attached directly to the JSON returned to the authenticated user --
+                # not sensitive (no financial figures), but a debug-only field that was
+                # never gated behind an env flag or removed. Log it server-side instead;
+                # the client response no longer carries it.
+                logger.warning(
+                    "xero profitloss parsed all-zero email=%s labels=%s",
+                    email,
+                    [k for k in summaries.keys() if "::" not in k][:20],
+                )
             return out
         if p == "wave":
             q1 = {"query": "{businesses(page:1,pageSize:1){edges{node{id}}}}"}
