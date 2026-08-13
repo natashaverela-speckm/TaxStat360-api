@@ -308,7 +308,33 @@ def ddb_get_user(email):
     email = _norm_email(email)
     if not email:
         return None
-    r = _users_tbl.get_item(Key={"email": email})
+    # AUTH-SESSION HARDENING (Phase 1, Audit Synthesis, Aug 2026): ConsistentRead=True.
+    #
+    # This was an eventually-consistent read (boto3/DynamoDB default). Every login,
+    # session check, and MFA step calls this function, often immediately after a write
+    # to the SAME item in the SAME request (_complete_login writes the user record, then
+    # _make_session's own ddb_get_user call reads it back a few lines later to fetch the
+    # current session_epoch) or a few requests apart (login writes, /auth/me reads
+    # moments later). An eventually-consistent read can return a stale copy of an item
+    # that was just written -- which reproduces exactly the symptom in KNOWN_LIMITATIONS.md
+    # "AUTH-SESSION": login succeeds, the very next /auth/me fails, and it "resolves
+    # without a discernible client-side cause on a later attempt" (i.e. once the
+    # eventually-consistent replica catches up).
+    #
+    # IMPORTANT: this is a plausible contributing factor identified by static review, NOT
+    # a confirmed root cause -- the CORS/SameSite/cookie-domain configuration was checked
+    # in this same pass and is already correct (samesite="none", secure=True, Domain=
+    # SESSION_COOKIE_DOMAIN, and the caller's origin is in ALLOWED_ORIGINS with
+    # allow_credentials=True), which rules out the ORIGINAL hypothesis in that
+    # KNOWN_LIMITATIONS.md entry. The AUTH1 diagnostic logging added in an earlier Audit
+    # Synthesis pass (_session_email, _verify_session, _set_session_cookie) is still the
+    # authoritative way to confirm this fix actually addresses a live recurrence: if the
+    # bug reproduces again, check CloudWatch for "AUTH1 verify_session ... result=fail
+    # reason=user_not_found" or "reason=epoch_mismatch" immediately after a "AUTH1
+    # set_session_cookie" line for the same email -- that pairing is the fingerprint of
+    # exactly the staleness this change targets. ConsistentRead has no functional
+    # downside for a users table at this traffic volume (higher RCU cost only).
+    r = _users_tbl.get_item(Key={"email": email}, ConsistentRead=True)
     item = r.get("Item")
     if not item:
         return None
