@@ -2,9 +2,10 @@
 #
 # L-3 -- removed packages with zero import sites anywhere in app/, tests/, or
 # scripts/ (confirmed via repo-wide grep before removal): motor, pymongo,
-# httpx, loguru, PyJWT, langgraph, passlib, python-multipart, pydantic-settings.
+# httpx, loguru, PyJWT, langgraph, passlib, pydantic-settings.
 # Unnecessary supply-chain surface for no benefit -- nothing in this codebase
 # imports any of them.
+# python-multipart is required again for /extract/tax-1040-carryforward (File/Form).
 #
 # L-5 -- every entry now has an upper bound. Previously everything but bcrypt
 # and pydantic used a bare ">=" with no ceiling, so a fresh install could
@@ -14,6 +15,7 @@
 # boundary while still allowing routine patch/security updates through.
 openai>=2.53.0,<3.0.0
 fastapi>=0.141.1,<0.142.0
+python-multipart>=0.0.20,<1.0.0
 uvicorn>=0.52.1,<0.53.0
 python-dotenv>=1.2.2,<2.0.0
 email-validator>=2.3.0,<3.0.0
