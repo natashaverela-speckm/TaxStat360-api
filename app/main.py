@@ -51,7 +51,7 @@ import qrcode
 from cryptography.fernet import Fernet
 
 from boto3.dynamodb.conditions import Key
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel
@@ -1111,7 +1111,7 @@ def _send_verification_email(email, verify_tok):
         "</div>"
     )
     ses = _mailer()   # AUDIT F-8d: SendGrid, not SES (SES sandbox drops all customer mail)
-    ses.send_email(
+        ses.send_email(
         Source=RESET_FROM,
         Destination={"ToAddresses": [email]},
         Message={"Subject": {"Data": "Confirm your email for TaxStat360"}, "Body": {"Html": {"Data": html}}},
@@ -1257,7 +1257,7 @@ def login(r: Log, request: Request):
         login_token = secrets.token_hex(32)
         x["mfa_login_token"] = login_token
         x["mfa_login_exp"] = int(time.time()) + MFA_LOGIN_TTL
-        new_tok = secrets.token_hex(32)
+    new_tok = secrets.token_hex(32)
         x["tok"] = new_tok
         ddb_put_user(email, x)
         return JSONResponse(
@@ -2190,7 +2190,7 @@ def _exchange_oauth_code(provider, code):
         )
     elif provider == "freshbooks":
         return _freshbooks_token_exchange(o, secret, code)
-    else:
+        else:
         r = requests.post(
             TOKEN_URLS[provider],
             json={
@@ -2619,15 +2619,15 @@ def forgot_password(r: ForgotReq, request: Request):
                     "Body": {
                         "Html": {
                             "Data": (
-                                '<div style="font-family:-apple-system,sans-serif;max-width:520px;'
-                                'margin:0 auto;padding:40px 24px">'
-                                '<h2 style="color:#0D1B3E">Reset your password</h2>'
-                                '<p>We received a request to reset your TaxStat360 password. '
+                        '<div style="font-family:-apple-system,sans-serif;max-width:520px;'
+                        'margin:0 auto;padding:40px 24px">'
+                        '<h2 style="color:#0D1B3E">Reset your password</h2>'
+                        '<p>We received a request to reset your TaxStat360 password. '
                                 "This link expires in 1 hour.</p>"
-                                f'<p><a href="{reset_url}" style="background:#2563EB;color:#fff;'
-                                'padding:12px 20px;border-radius:8px;text-decoration:none;'
-                                'display:inline-block">Reset Password</a></p>'
-                                '<p style="color:#475569;font-size:13px">If you did not request this, '
+                        f'<p><a href="{reset_url}" style="background:#2563EB;color:#fff;'
+                        'padding:12px 20px;border-radius:8px;text-decoration:none;'
+                        'display:inline-block">Reset Password</a></p>'
+                        '<p style="color:#475569;font-size:13px">If you did not request this, '
                                 "you can safely ignore this email.</p>"
                                 "</div>"
                             )
@@ -2647,8 +2647,8 @@ def reset_password(r: ResetReq, request: Request):
     x = ddb_get_user(email)
     if (
         not x
-        or not x.get("reset_tok")
-        or not secrets.compare_digest(x.get("reset_tok", ""), r.token)
+            or not x.get("reset_tok")
+            or not secrets.compare_digest(x.get("reset_tok", ""), r.token)
         or x.get("reset_exp", 0) < int(time.time())
     ):
         raise HTTPException(400, "Invalid or expired reset link")
@@ -2744,3 +2744,141 @@ async def stripe_webhook(request: Request):
             event.get("id", "") if isinstance(event, dict) else "",
         )
     return {"status": "ok"}
+
+
+# ── Phase 10: shared extract engine (tax-1040-carryforward) ───────────────────
+# TaxStat360 authenticates with its own JWT; this proxy calls RepsRecord's
+# extract-document with EXTRACT_SERVICE_KEY. Tax PDFs are never stored in the
+# RepsRecord Evidence bucket (delete-after-processing).
+
+EXTRACT_DOCUMENT_URL = os.environ.get(
+    "EXTRACT_DOCUMENT_URL",
+    "https://ehuttijifubonhhgnvzx.supabase.co/functions/v1/extract-document",
+)
+EXTRACT_SERVICE_KEY = os.environ.get("EXTRACT_SERVICE_KEY", "")
+EXTRACT_ANON_KEY = os.environ.get("EXTRACT_ANON_KEY", "") or os.environ.get(
+    "SUPABASE_ANON_KEY", ""
+)
+
+_TAX_1040_STUB_FIELDS = {
+    "priorPassiveLossCarryforward": None,
+    "priorSuspendedLoss": None,
+    "capLossCarryforwardST": None,
+    "capLossCarryforwardLT": None,
+    "nolCarryforward": None,
+    "priorYearQBILoss": None,
+    "priorYearTax": None,
+    "priorYearAGI": None,
+}
+
+_TAX_FIXTURE_TOKEN = "fixture-tax-1040-smoke"
+_TAX_FIXTURE_FIELDS = {
+    "priorPassiveLossCarryforward": 12500,
+    "priorSuspendedLoss": 3200,
+    "capLossCarryforwardST": 1500,
+    "capLossCarryforwardLT": 8000,
+    "nolCarryforward": None,
+    "priorYearQBILoss": 4500,
+    "priorYearTax": 18750,
+    "priorYearAGI": 142000,
+}
+
+
+def _tax_1040_local_stub(file_name: str) -> dict:
+    """Dev fallback when EXTRACT_SERVICE_KEY is not configured."""
+    name = (file_name or "").lower()
+    fields = (
+        dict(_TAX_FIXTURE_FIELDS)
+        if _TAX_FIXTURE_TOKEN in name
+        else dict(_TAX_1040_STUB_FIELDS)
+    )
+    warnings = [
+        "Local API stub — set EXTRACT_DOCUMENT_URL + EXTRACT_SERVICE_KEY to call the shared engine.",
+        "Tax PDF is not stored in RepsRecord Evidence (delete-after-processing).",
+        "Review every extracted figure before saving.",
+    ]
+    return {
+        "ok": True,
+        "profile": "tax-1040-carryforward",
+        "fields": fields,
+        "warnings": warnings,
+        "providerMeta": {"provider": "stub", "model": "api-local-stub"},
+        "evidence": {
+            "retained": False,
+            "deletedAfterProcessing": True,
+            "retention": "delete-after-processing",
+        },
+    }
+
+
+@app.post("/extract/tax-1040-carryforward")
+async def extract_tax_1040_carryforward(
+    file: UploadFile = File(...),
+    profile: str = Form("tax-1040-carryforward"),
+    user=Depends(require_plan("professional")),
+):
+    """Prefill carryforward wizard from prior-year PDF/image (HITL — review before save)."""
+    if profile and profile != "tax-1040-carryforward":
+        raise HTTPException(400, "Only profile tax-1040-carryforward is supported here.")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "Empty file.")
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(400, "File exceeds 10 MB limit.")
+
+    fname = file.filename or "prior-year-1040.pdf"
+    ctype = file.content_type or "application/pdf"
+
+    if not EXTRACT_SERVICE_KEY:
+        logger.info(
+            "extract tax-1040 local stub for %s file=%s",
+            user.get("email"),
+            fname,
+        )
+        return _tax_1040_local_stub(fname)
+
+    # Forward multipart to shared extract-document (service auth — no Evidence write).
+    try:
+        files = {"file": (fname, raw, ctype)}
+        data = {"profile": "tax-1040-carryforward"}
+        headers = {"x-extract-service-key": EXTRACT_SERVICE_KEY}
+        if EXTRACT_ANON_KEY:
+            headers["apikey"] = EXTRACT_ANON_KEY
+            headers["Authorization"] = f"Bearer {EXTRACT_ANON_KEY}"
+        r = requests.post(
+            EXTRACT_DOCUMENT_URL,
+            files=files,
+            data=data,
+            headers=headers,
+            timeout=90,
+        )
+    except requests.RequestException as e:
+        logger.warning("extract-document proxy failed: %s", e)
+        raise HTTPException(502, "Shared extract service unavailable. Enter values manually.")
+
+    try:
+        body = r.json()
+    except ValueError:
+        body = {"ok": False, "error": "Invalid response from extract service."}
+
+    if r.status_code >= 400 or not body.get("ok", True):
+        detail = body.get("error") or body.get("message") or f"Extract failed ({r.status_code})"
+        raise HTTPException(r.status_code if r.status_code >= 400 else 502, detail)
+
+    # Belt-and-suspenders: never claim Evidence retention for tax.
+    ev = body.get("evidence") or {}
+    if ev.get("retained") is True or ev.get("path") or ev.get("bucket") == "Evidence":
+        body["evidence"] = {
+            "retained": False,
+            "deletedAfterProcessing": True,
+            "retention": "delete-after-processing",
+        }
+        logger.warning("stripped Evidence retention from tax-1040 extract response")
+
+    logger.info(
+        "extract tax-1040 ok for %s file=%s",
+        user.get("email"),
+        fname,
+    )
+    return body
