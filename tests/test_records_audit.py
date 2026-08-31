@@ -54,3 +54,25 @@ def test_identity_mismatch_writes_its_own_audit_signature(client, main):
     row = sorted(rows, key=lambda r: r["ts"])[-1]
     assert row["actor"] == email and row["target"] == "intruder@example.com"
     assert row["status"] == "blocked"
+
+
+# M-3 (fresh-pass audit, Aug 2026) -------------------------------------------
+def test_record_delete_audit_row_carries_source_ip(client, main):
+    email = _login(client, main, "ip-record-audit@example.com")
+    client.put("/records", json={"id": 42, "name": "IP test", "expectedUser": email})
+    r = client.delete("/records/42", headers={"x-forwarded-for": "203.0.113.9, 10.0.0.2"})
+    assert r.status_code == 200
+    row = sorted(_audit_rows(main, "record.delete"), key=lambda r: r["ts"])[-1]
+    assert row["ip"] == "10.0.0.2"
+
+
+def test_identity_mismatch_audit_row_carries_source_ip(client, main):
+    _login(client, main, "ip-mismatch-audit@example.com")
+    r = client.put(
+        "/records",
+        json={"id": 1, "expectedUser": "intruder@example.com"},
+        headers={"x-forwarded-for": "203.0.113.11, 10.0.0.3"},
+    )
+    assert r.status_code == 409
+    row = sorted(_audit_rows(main, "identity.mismatch"), key=lambda r: r["ts"])[-1]
+    assert row["ip"] == "10.0.0.3"

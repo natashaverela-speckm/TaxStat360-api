@@ -32,9 +32,12 @@ def test_change_email_ignores_body_email_cross_account(client, main, monkeypatch
     _auth(client, main, user_a)
     monkeypatch.setattr(main, "_send_verification_email", lambda *args: None)
 
+    # SECURITY FIX (fresh-pass audit, Aug 2026): change-email now requires
+    # re-proof of the current credential -- see change_email() in main.py.
+    # user_a's password is "pw123456" (set by _mk_user's default).
     r = client.post(
         "/auth/change-email",
-        json={"email": user_b, "new_email": "new@example.com"},
+        json={"email": user_b, "new_email": "new@example.com", "password": "pw123456"},
     )
     assert r.status_code == 200, r.text
     assert main.ddb_get_user(user_b) is not None
@@ -49,7 +52,8 @@ def test_change_email_own_account_reverifies_and_refreshes_session(client, main,
     _auth(client, main, old)
     monkeypatch.setattr(main, "_send_verification_email", lambda *args: None)
 
-    r = client.post("/auth/change-email", json={"new_email": new})
+    # SECURITY FIX (fresh-pass audit, Aug 2026): re-proof required -- see above.
+    r = client.post("/auth/change-email", json={"new_email": new, "password": "pw123456"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True

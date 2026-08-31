@@ -1,4 +1,4 @@
-import json, logging, os, hashlib, secrets, stripe, requests, boto3, time, hmac, bcrypt, base64, io
+import logging, os, hashlib, secrets, stripe, requests, boto3, time, hmac, bcrypt, base64, io
 # AUDIT F-8c: datetime/timezone/timedelta are needed by _send_trial_confirmation_email()
 # to compute the trial-end date. Only `date` was imported; using the others without this
 # line raises NameError on every signup.
@@ -54,9 +54,8 @@ from boto3.dynamodb.conditions import Key
 from fastapi import FastAPI, HTTPException, Request, Depends, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
@@ -86,23 +85,89 @@ app = FastAPI(
     redoc_url="/redoc" if _DOCS_ENABLED else None,
     openapi_url="/openapi.json" if _DOCS_ENABLED else None,
 )
-limiter = Limiter(key_func=get_remote_address)
+# SECURITY FIX (fresh-pass audit, Aug 2026): slowapi's default get_remote_address
+# reads the raw TCP socket address. Production runs behind a reverse proxy, so
+# every real visitor shares the proxy's socket-level address — every rate-limit
+# bucket (login, register, password reset, MFA, form relay) was effectively
+# shared across ALL users, not per-visitor. That both weakens brute-force
+# protection (one attacker's failed attempts throttle everyone else too) and
+# creates a trivial denial-of-service (one attacker exhausts the shared login
+# bucket for the whole user base). _client_ip() (defined below) already exists
+# and is used for the audit-log IP field; reuse it here as the limiter's key so
+# each real visitor gets their own bucket. _client_ip is resolved lazily inside
+# the lambda (called per-request, well after module load), so its definition
+# later in this file is fine.
+limiter = Limiter(key_func=lambda request: _client_ip(request))
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+ALLOWED_ORIGINS = [
+    "https://www.taxstat360.com",
+    "https://taxstat360.com",
+    "http://localhost:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://www.taxstat360.com",
-        "https://taxstat360.com",
-        "http://localhost:5173",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-DB = "/home/ubuntu/risk-planner-BE/users.json"
+# SECURITY FIX (fresh-pass audit, Aug 2026) — CSRF via CORS "simple requests".
+#
+# The session cookie is samesite="none" (required so the app works embedded /
+# cross-site for the integration flows), which disables SameSite's built-in CSRF
+# protection. Several endpoints parse the body with `await request.json()`
+# instead of a declared Pydantic model and/or mutate state from nothing but the
+# session cookie (PUT /records, POST /integrations/{p}/disconnect, POST /aria).
+# A cross-origin page can issue a "simple request" — e.g. Content-Type:
+# text/plain, or a bare bodyless POST — which the browser sends WITH cookies
+# and WITHOUT a CORS preflight, regardless of what CORSMiddleware's
+# allow_origins says (that list only governs whether the attacker's JS may
+# *read* the response, not whether the browser *sends* the request). Reproduced
+# live: a malicious page could silently disconnect a signed-in victim's
+# accounting integration, tamper with their saved tax-entity data, or spend
+# their Aria/OpenAI quota, with no user interaction beyond loading the page.
+#
+# Fix: reject any cookie-authenticated, state-changing request whose Origin
+# (or Referer, as a fallback for clients that omit Origin) isn't one of our own
+# origins. This is applied as middleware — not per-route — so it automatically
+# covers every current and future mutating endpoint rather than requiring each
+# new route to remember to opt in. GET/HEAD/OPTIONS are exempt (they should
+# never mutate state); requests with no session cookie are exempt (there is no
+# authenticated action to forge — e.g. /auth/login, /auth/register, the public
+# contact-form relay, and the Stripe webhook, which authenticates via signature
+# and carries no session cookie at all).
+_CSRF_CHECKED_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _origin_allowed(origin_or_referer):
+    if not origin_or_referer:
+        return False
+    for allowed in ALLOWED_ORIGINS:
+        if origin_or_referer == allowed or origin_or_referer.startswith(allowed + "/"):
+            return True
+    return False
+
+
+@app.middleware("http")
+async def _csrf_origin_check(request: Request, call_next):
+    if request.method in _CSRF_CHECKED_METHODS and request.cookies.get(SESSION_COOKIE):
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        if not _origin_allowed(origin) and not _origin_allowed(referer):
+            logger.warning(
+                "CSRF check blocked %s %s (origin=%r referer=%r)",
+                request.method, request.url.path, origin, referer,
+            )
+            return JSONResponse({"detail": "Cross-site request blocked"}, status_code=403)
+    return await call_next(request)
+
+# DEAD-CODE REMOVAL (fresh-pass audit, Aug 2026): the DB="...users.json" constant
+# was removed along with load()'s JSON-file fallback branch (see load(), below) --
+# it had no other callers.
 
 # --- M1 AUTH (DynamoDB + bcrypt + session cookie) ---
 USERS_TABLE = os.environ.get("USERS_TABLE", "taxstat360-users")
@@ -111,7 +176,32 @@ USERS_STRIPE_CUSTOMER_GSI = os.environ.get(
 )
 SESSION_COOKIE = "ts360_session"
 SESSION_MAX_AGE = 7 * 24 * 3600
-SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-in-env")
+
+
+def _resolve_secret_key():
+    """Resolve SECRET_KEY, failing closed unconditionally.
+
+    SECURITY FIX (independent review, Aug 2026): SECRET_KEY signs every session
+    cookie (_make_session/_verify_session below) and derives the Fernet key that
+    encrypts MFA/TOTP secrets (_mfa_fernet). It previously fell back to the
+    hardcoded literal "change-me-in-env" — a value visible to anyone who reads
+    this public-facing source file. If the real env var were ever missing
+    (deploy misconfiguration, a wiped .env, a typo'd key name), the app would
+    start normally but sign every session with that known literal: anyone could
+    forge a valid ts360_session cookie for any email address, and anyone who
+    had already enabled MFA would have a decryptable-by-anyone TOTP secret.
+    Mirrors the STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET checks elsewhere in
+    this file: fail closed, always, no environment-based carve-out. Local/dev/
+    test setups already supply their own value (see tests/conftest.py and
+    scripts/qb_pl_migration_diff.py), same as those two keys require today.
+    """
+    key = os.environ.get("SECRET_KEY", "")
+    if not key:
+        raise RuntimeError("SECRET_KEY environment variable not set")
+    return key
+
+
+SECRET_KEY = _resolve_secret_key()
 # Share session cookie across www/app subdomains; empty in tests/local.
 SESSION_COOKIE_DOMAIN = os.environ.get("SESSION_COOKIE_DOMAIN", ".taxstat360.com")
 
@@ -141,6 +231,29 @@ def _from_ddb(obj):
 
 def _norm_email(email):
     return (email or "").strip().lower()
+
+
+def _client_ip(request):
+    """Best-effort client IP for forensic/audit fields only — never for access control.
+
+    SECURITY FIX (fresh-pass audit, Aug 2026): previously took X-Forwarded-For
+    as-is. That header is client-supplied and trivially spoofable (a client can
+    send "X-Forwarded-For: 1.2.3.4" and have it recorded verbatim). The format
+    is a comma-separated hop chain — "client, proxy1, proxy2, ..." — where each
+    hop APPENDS the address it received the request from. Behind exactly one
+    trusted reverse proxy (the normal single-hop setup: an ALB, CloudFront, or
+    nginx in front of this app), the LAST entry in that chain is the one the
+    trusted proxy itself observed and appended, so it can't have been forged by
+    the client — everything before it can be. Falls back to the raw socket
+    address when the header is absent. This is still advisory data for the
+    audit trail, not a security control; nothing in this app gates access on it.
+    """
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        last_hop = xff.split(",")[-1].strip()
+        if last_hop:
+            return last_hop
+    return request.client.host if request.client else ""
 
 
 def _hash_password(password):
@@ -195,7 +308,33 @@ def ddb_get_user(email):
     email = _norm_email(email)
     if not email:
         return None
-    r = _users_tbl.get_item(Key={"email": email})
+    # AUTH-SESSION HARDENING (Phase 1, Audit Synthesis, Aug 2026): ConsistentRead=True.
+    #
+    # This was an eventually-consistent read (boto3/DynamoDB default). Every login,
+    # session check, and MFA step calls this function, often immediately after a write
+    # to the SAME item in the SAME request (_complete_login writes the user record, then
+    # _make_session's own ddb_get_user call reads it back a few lines later to fetch the
+    # current session_epoch) or a few requests apart (login writes, /auth/me reads
+    # moments later). An eventually-consistent read can return a stale copy of an item
+    # that was just written -- which reproduces exactly the symptom in KNOWN_LIMITATIONS.md
+    # "AUTH-SESSION": login succeeds, the very next /auth/me fails, and it "resolves
+    # without a discernible client-side cause on a later attempt" (i.e. once the
+    # eventually-consistent replica catches up).
+    #
+    # IMPORTANT: this is a plausible contributing factor identified by static review, NOT
+    # a confirmed root cause -- the CORS/SameSite/cookie-domain configuration was checked
+    # in this same pass and is already correct (samesite="none", secure=True, Domain=
+    # SESSION_COOKIE_DOMAIN, and the caller's origin is in ALLOWED_ORIGINS with
+    # allow_credentials=True), which rules out the ORIGINAL hypothesis in that
+    # KNOWN_LIMITATIONS.md entry. The AUTH1 diagnostic logging added in an earlier Audit
+    # Synthesis pass (_session_email, _verify_session, _set_session_cookie) is still the
+    # authoritative way to confirm this fix actually addresses a live recurrence: if the
+    # bug reproduces again, check CloudWatch for "AUTH1 verify_session ... result=fail
+    # reason=user_not_found" or "reason=epoch_mismatch" immediately after a "AUTH1
+    # set_session_cookie" line for the same email -- that pairing is the fingerprint of
+    # exactly the staleness this change targets. ConsistentRead has no functional
+    # downside for a users table at this traffic volume (higher RCU cost only).
+    r = _users_tbl.get_item(Key={"email": email}, ConsistentRead=True)
     item = r.get("Item")
     if not item:
         return None
@@ -302,19 +441,16 @@ def ddb_find_user_by_stripe_customer_id(stripe_customer_id):
     return None, None
 
 
+# DEAD-CODE REMOVAL (fresh-pass audit, Aug 2026): load() used to fall back to
+# reading the pre-DynamoDB `users.json` file (DB, below) if DynamoDB came back
+# empty. In production, DynamoDB has held every real account since the M1
+# migration -- ddb_all_users() only returns empty on a brand-new/disaster-
+# recovery table, at which point users.json (last written before that
+# migration) would be stale data anyway, not a safe recovery source. Also
+# removed save(u), the JSON-file writer this fallback implied -- it had zero
+# call sites (every write path already goes through ddb_put_user directly).
 def load():
-    users = ddb_all_users()
-    if users:
-        return users
-    if os.path.exists(DB):
-        return json.load(open(DB))
-    return {}
-
-
-def save(u):
-    """Write users to DynamoDB. Prefer ddb_put_user(email, rec) for single-user updates."""
-    for email, rec in u.items():
-        ddb_put_user(email, rec)
+    return ddb_all_users()
 
 
 def _ddb_update_user_plan(stripe_customer_id, plan):
@@ -333,14 +469,31 @@ def _ddb_update_user_plan(stripe_customer_id, plan):
 
 
 def _make_session(email):
-    payload = f"{_norm_email(email)}:{int(time.time())}:{secrets.token_hex(16)}"
+    # SECURITY FIX (fresh-pass audit, Aug 2026, finding H-1): the signed session
+    # token used to embed nothing that a password reset could invalidate, so a
+    # stolen session token stayed valid for its full 7-day life even after the
+    # textbook remediation (the user changing their password). Every token now
+    # embeds the user's current session_epoch; _verify_session rejects any token
+    # whose embedded epoch doesn't match the user's CURRENT stored epoch, and
+    # reset_password bumps that epoch, which instantly invalidates every
+    # previously-issued token for that account.
+    email = _norm_email(email)
+    rec = ddb_get_user(email) or {}
+    epoch = int(rec.get("session_epoch", 0) or 0)
+    payload = f"{email}:{epoch}:{int(time.time())}:{secrets.token_hex(16)}"
     sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
     import base64 as _b64
     return _b64.urlsafe_b64encode(f"{payload}:{sig}".encode()).decode()
 
 
 def _verify_session(token):
+    # AUTH-1 DIAGNOSTIC (Audit Synthesis, Aug 2026): every return path below now logs
+    # WHY verification failed, tagged with a short, non-reversible fingerprint of the
+    # token (not the token itself, not the signing key) so repeated failures for the
+    # SAME cookie can be correlated across log lines without exposing the credential.
+    fp = hashlib.sha256(token.encode()).hexdigest()[:12] if token else "none"
     if not token:
+        logger.info("AUTH1 verify_session fp=%s result=fail reason=no_token", fp)
         return None
     try:
         import base64 as _b64
@@ -348,22 +501,72 @@ def _verify_session(token):
         payload, sig = raw.rsplit(":", 1)
         expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected):
+            logger.info("AUTH1 verify_session fp=%s result=fail reason=bad_signature", fp)
             return None
-        email, ts, _ = payload.split(":", 2)
-        if int(time.time()) - int(ts) > SESSION_MAX_AGE:
+        parts = payload.split(":")
+        if len(parts) == 4:
+            # Current format: email:epoch:ts:nonce (see _make_session, H-1 fix).
+            email, epoch_s, ts, _nonce = parts
+            token_epoch = int(epoch_s)
+        elif len(parts) == 3:
+            # Legacy format (email:ts:nonce), issued before the H-1 fix shipped.
+            # Treated as epoch 0 so sessions already live at deploy time keep
+            # working right up until the user's epoch is first bumped (e.g. by
+            # a password reset) -- at which point they correctly stop validating.
+            email, ts, _nonce = parts
+            token_epoch = 0
+        else:
+            logger.info("AUTH1 verify_session fp=%s result=fail reason=bad_format parts=%d", fp, len(parts))
             return None
-        return _norm_email(email)
-    except Exception:
+        age = int(time.time()) - int(ts)
+        if age > SESSION_MAX_AGE:
+            logger.info("AUTH1 verify_session fp=%s result=fail reason=expired age_s=%d max_s=%d", fp, age, SESSION_MAX_AGE)
+            return None
+        email = _norm_email(email)
+        rec = ddb_get_user(email)
+        if not rec:
+            logger.info("AUTH1 verify_session fp=%s result=fail reason=user_not_found email=%s", fp, email)
+            return None
+        current_epoch = int(rec.get("session_epoch", 0) or 0)
+        if token_epoch != current_epoch:
+            logger.info(
+                "AUTH1 verify_session fp=%s result=fail reason=epoch_mismatch email=%s token_epoch=%d current_epoch=%d",
+                fp, email, token_epoch, current_epoch,
+            )
+            return None
+        logger.info("AUTH1 verify_session fp=%s result=ok email=%s", fp, email)
+        return email
+    except Exception as e:
+        logger.info("AUTH1 verify_session fp=%s result=fail reason=exception detail=%s", fp, e)
         return None
 
 
 def _session_email(request):
-    email = _verify_session(request.cookies.get(SESSION_COOKIE, ""))
-    if email:
-        return email
+    # AUTH-1 DIAGNOSTIC (Audit Synthesis, Aug 2026): records which credential source
+    # was present on this request and which one (if either) resolved -- this is the
+    # single call site both /auth/me and every other authenticated route go through,
+    # so it's the one place to look to answer "did the browser even SEND the cookie."
+    cookie_val = request.cookies.get(SESSION_COOKIE, "")
     auth = request.headers.get("authorization", "")
-    if auth.lower().startswith("bearer "):
-        return _verify_session(auth[7:].strip())
+    has_bearer = auth.lower().startswith("bearer ")
+    email = _verify_session(cookie_val)
+    if email:
+        logger.info(
+            "AUTH1 session_email path=%s source=cookie result=ok had_cookie=%s had_bearer=%s",
+            request.url.path, bool(cookie_val), has_bearer,
+        )
+        return email
+    if has_bearer:
+        email = _verify_session(auth[7:].strip())
+        logger.info(
+            "AUTH1 session_email path=%s source=bearer result=%s had_cookie=%s",
+            request.url.path, "ok" if email else "fail", bool(cookie_val),
+        )
+        return email
+    logger.info(
+        "AUTH1 session_email path=%s source=none result=fail had_cookie=%s had_bearer=%s",
+        request.url.path, bool(cookie_val), has_bearer,
+    )
     return None
 
 
@@ -381,6 +584,16 @@ def _set_session_cookie(response, email, session_value=None):
     if SESSION_COOKIE_DOMAIN:
         kwargs["domain"] = SESSION_COOKIE_DOMAIN
     response.set_cookie(**kwargs)
+    # AUTH-1 DIAGNOSTIC (Audit Synthesis, Aug 2026): confirms, from inside the app,
+    # that the Set-Cookie call actually ran and with what attributes -- so if a user
+    # still can't stay logged in, we can rule the app OUT (or IN) by checking whether
+    # this line fired for their login. Logs email + cookie attributes only, never the
+    # token value itself.
+    logger.info(
+        "AUTH1 set_session_cookie email=%s domain=%s samesite=%s secure=%s max_age=%s",
+        _norm_email(email), kwargs.get("domain", "<unset>"), kwargs["samesite"],
+        kwargs["secure"], kwargs["max_age"],
+    )
 
 
 def _clear_session_cookie(response):
@@ -551,7 +764,13 @@ def _ensure_audit_table():
         logger.warning("AUDIT table auto-create skipped: %s", e)
 
 
-def _write_audit(action, actor_email, target_email, status, detail=None):
+def _write_audit(action, actor_email, target_email, status, detail=None, ip=""):
+    # SECURITY FIX (fresh-pass audit, Aug 2026, finding M-3): account.delete,
+    # record.delete, and identity.mismatch are the most sensitive events this
+    # app audits, but the audit row itself carried no source IP -- even though
+    # /records already treats IP forensics as important enough to stamp on
+    # every record write (see writtenByIp on /records PUT). Same _client_ip()
+    # pattern, now on the audit writer too.
     item = {
         "auditId": secrets.token_hex(16),
         "ts": int(time.time()),
@@ -559,6 +778,7 @@ def _write_audit(action, actor_email, target_email, status, detail=None):
         "actor": _norm_email(actor_email),
         "target": _norm_email(target_email),
         "status": status,  # "started" | "completed" | "failed"
+        "ip": ip or "",
     }
     if detail is not None:
         item["detail"] = str(detail)[:1000]
@@ -687,7 +907,7 @@ def _delete_user_record(email):
     _users_tbl.delete_item(Key={"email": _norm_email(email)})
 
 
-def _perform_account_deletion(target_email, actor_email):
+def _perform_account_deletion(target_email, actor_email, ip=""):
     """Single source of truth for both the self-delete and admin-delete endpoints.
     Order: Stripe -> records -> user -> audit. Re-runnable; never half-commits the
     DB on a Stripe failure."""
@@ -699,7 +919,7 @@ def _perform_account_deletion(target_email, actor_email):
     user = ddb_get_user(target_email)  # may be None on an idempotent re-run
     user_rec = user if isinstance(user, dict) else {}
     logger.info("account.delete started actor=%s target=%s", actor_email, target_email)
-    _write_audit("account.delete", actor_email, target_email, "started")
+    _write_audit("account.delete", actor_email, target_email, "started", ip=ip)
     try:
         stripe_cid = user_rec.get("stripe_customer_id", "") or ""
         # 1 + 2. Stripe first: a hard failure here aborts before any DB delete.
@@ -720,6 +940,7 @@ def _perform_account_deletion(target_email, actor_email):
             target_email,
             "completed",
             detail=f"stripe={stripe_result} records_deleted={records_deleted} existed={user is not None}",
+            ip=ip,
         )
         return {
             "ok": True,
@@ -740,8 +961,15 @@ def _perform_account_deletion(target_email, actor_email):
             target_email,
             type(e).__name__,
         )
-        _write_audit("account.delete", actor_email, target_email, "failed", detail=str(e))
-        raise HTTPException(502, f"Account deletion failed before completion: {e}")
+        _write_audit("account.delete", actor_email, target_email, "failed", detail=str(e), ip=ip)
+        # AUDIT FIX (fresh-eyes re-audit, Aug 2026): the raw exception string (could
+        # include internal DynamoDB/Stripe error text) was going straight into the
+        # response body. Every other error path in this file returns a generic
+        # client-safe message and logs detail server-side instead (see logger.exception
+        # and _write_audit above, both of which already capture the real detail) --
+        # this path did not get that treatment. Generic message only, detail stays
+        # server-side.
+        raise HTTPException(502, "Account deletion failed before completion. Support has been notified; please try again or contact support@taxstat360.com.")
 
 
 # --- M3 MFA (TOTP + encrypted backup codes) ---
@@ -824,8 +1052,11 @@ def _mfa_verify_backup(hashes, code):
 
 
 def _complete_login(email, x):
-    new_tok = secrets.token_hex(32)
-    x["tok"] = new_tok
+    # DEAD-CODE REMOVAL (fresh-pass audit, Aug 2026): this used to also write a
+    # random x["tok"] value, generated but never sent to the client (the client
+    # only ever receives `access_token`, the signed session value below) -- it
+    # existed solely for the now-removed get_user_from_token() legacy auth path.
+    # See that removal note for the full trace.
     x.pop("mfa_login_token", None)
     x.pop("mfa_login_exp", None)
     ddb_put_user(email, x)
@@ -859,37 +1090,43 @@ def mc_subscribe(email, name=""):
         logger.warning("mailchimp subscribe failed for %s: %s", email, e)
 
 
-def get_user_from_token(request: Request):
-    auth = request.headers.get("authorization", "")
-    tok = auth.replace("Bearer ", "").strip()
-    if not tok:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    u = load()
-    for email, x in u.items():
-        if x.get("tok") == tok:
-            return {"email": email, **x}
-    raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-
+# DEAD-CODE REMOVAL (fresh-pass audit, Aug 2026): get_user_from_token() and
+# require_plan() used to live here. Traced end-to-end and confirmed genuinely
+# dead, not just unused-by-convention:
+#   - The `tok` field it checked (x.get("tok")) is written to DynamoDB at
+#     login/register/verify (a random secrets.token_hex(32)) but that value is
+#     NEVER sent back to the client anywhere -- the client only ever receives
+#     `access_token` (the separate, signed session value from _make_session()).
+#     So no legitimate client could ever present a token this function would
+#     accept; the write was pure write-only state.
+#   - The frontend has zero references to /user/me or /user/business-info (the
+#     only two routes that depended on this), confirmed via a full-repo grep.
+#   - The real, live auth path everywhere else in this file (session cookie or
+#     a Bearer header carrying the *signed* session token) is _session_email() /
+#     _require_session_user(), which this bypassed entirely.
+# Removed rather than left in place per the audit's recommendation: an unused
+# auth path that does a full user-table scan with a non-constant-time compare
+# and issues tokens that never expire is a footgun for a future integration,
+# not a feature worth preserving. /user/me and /user/business-info are removed
+# with it (see below) since neither had any caller.
+#
+# PLAN_ORDER is still used by _require_minimum_plan() below and stays.
 PLAN_ORDER = ["starter", "professional", "enterprise"]
 
 
-def require_plan(minimum: str):
-    def checker(user=Depends(get_user_from_token)):
-        user_plan = user.get("plan", "starter")
-        if PLAN_ORDER.index(user_plan) < PLAN_ORDER.index(minimum):
-            raise HTTPException(
-                status_code=403,
-                detail=f"{minimum.capitalize()} plan required to access this feature",
-            )
-        return user
-
-    return checker
-
-
+# INPUT-HYGIENE FIX (fresh-pass audit, Aug 2026): email fields across the API were
+# plain `str` despite email-validator/pydantic[email] already being installed and
+# unused -- malformed addresses could reach storage or an outbound-email call
+# unvalidated. Switched the body-model fields below to EmailStr, which validates
+# at the API boundary while still being a str subtype, so _norm_email() and every
+# other downstream .strip()/.lower() call keeps working unchanged. Query-string
+# email params (verification_status, verify_email, admin_delete_user) are left as
+# str: they're used as "" = not-provided sentinels for optional/lookup params, and
+# EmailStr rejects "" outright, which would need a larger rework for no real
+# hygiene benefit (a malformed lookup just fails to match a user, same as today).
 class Reg(BaseModel):
     name: str
-    email: str
+    email: EmailStr
     password: str
     plan: str = "starter"
     # AUDIT F-8c (Jul 2026): the auto-renewal acknowledgment must state the AMOUNT and
@@ -901,12 +1138,12 @@ class Reg(BaseModel):
 
 
 class Log(BaseModel):
-    email: str
+    email: EmailStr
     password: str
 
 
 class Sub(BaseModel):
-    email: str
+    email: EmailStr
     plan: str
     payment_method_id: str
     billing: str = "monthly"
@@ -1072,11 +1309,11 @@ VERIFY_TTL = 86400
 
 
 class ForgotReq(BaseModel):
-    email: str
+    email: EmailStr
 
 
 class ResetReq(BaseModel):
-    email: str
+    email: EmailStr
     token: str
     new_password: str
 
@@ -1086,17 +1323,23 @@ class MfaCodeReq(BaseModel):
 
 
 class MfaChallengeReq(BaseModel):
-    email: str
+    email: EmailStr
     login_token: str
     code: str
 
 
 class ResendVerify(BaseModel):
-    email: str
+    email: EmailStr
 
 
 class ChangeEmailReq(BaseModel):
-    new_email: str
+    new_email: EmailStr
+    # SECURITY FIX (fresh-pass audit, Aug 2026): re-proof fields for the current
+    # credential — see change_email() below. Optional at the model level so a
+    # missing one produces our own 401 ("current password/code required")
+    # instead of a generic 422 from Pydantic.
+    password: str = ""
+    mfa_code: str = ""
 
 
 def _send_verification_email(email, verify_tok):
@@ -1111,7 +1354,7 @@ def _send_verification_email(email, verify_tok):
         "</div>"
     )
     ses = _mailer()   # AUDIT F-8d: SendGrid, not SES (SES sandbox drops all customer mail)
-        ses.send_email(
+    ses.send_email(
         Source=RESET_FROM,
         Destination={"ToAddresses": [email]},
         Message={"Subject": {"Data": "Confirm your email for TaxStat360"}, "Body": {"Html": {"Data": html}}},
@@ -1206,6 +1449,12 @@ def _send_trial_confirmation_email(email, name, plan, billing):
 @limiter.limit("3/minute")
 def register(r: Reg, request: Request):
     email = _norm_email(r.email)
+    # SECURITY FIX (fresh-pass audit, Aug 2026): /auth/reset-password has always
+    # enforced a 12-128 character password length, but /auth/register never did —
+    # any password, including a 1-character one, was accepted at signup. Applying
+    # the same rule here closes that gap without changing the reset-password path.
+    if not (12 <= len(r.password) <= 128):
+        raise HTTPException(400, "Password must be between 12 and 128 characters")
     if ddb_user_exists(email):
         raise HTTPException(400, "Email already registered")
     plan = r.plan if r.plan in VALID_PLANS else "starter"
@@ -1220,6 +1469,7 @@ def register(r: Reg, request: Request):
         "verified": False,
         "verify_tok": verify_tok,
         "verify_exp": int(time.time()) + VERIFY_TTL,
+        "session_epoch": 0,  # H-1 fix: bumped on password reset to revoke old sessions
     }
     ddb_put_user(email, rec)
     mc_subscribe(email, r.name)
@@ -1257,8 +1507,8 @@ def login(r: Log, request: Request):
         login_token = secrets.token_hex(32)
         x["mfa_login_token"] = login_token
         x["mfa_login_exp"] = int(time.time()) + MFA_LOGIN_TTL
-    new_tok = secrets.token_hex(32)
-        x["tok"] = new_tok
+        # DEAD-CODE REMOVAL (fresh-pass audit, Aug 2026): dropped the write-only
+        # x["tok"] here too -- see _complete_login's note above.
         ddb_put_user(email, x)
         return JSONResponse(
             {"mfa_required": True, "login_token": login_token, "email": email}
@@ -1289,6 +1539,13 @@ def mfa_setup(request: Request):
 
 
 @app.post("/auth/mfa/verify")
+# SECURITY FIX (fresh-pass audit, Aug 2026): this checks a 6-digit TOTP code
+# for an already-authenticated session with no throttling — an attacker who
+# has stolen a session cookie/token could brute-force the code (1,000,000
+# combinations) with no rate limit in the way. /auth/mfa/challenge (the
+# equivalent check during login, before a session exists) already limits to
+# 10/minute; applying the same limit here closes the same gap post-login.
+@limiter.limit("10/minute")
 def mfa_verify(r: MfaCodeReq, request: Request):
     email = _require_session_user(request)
     x = ddb_get_user(email)
@@ -1307,6 +1564,10 @@ def mfa_verify(r: MfaCodeReq, request: Request):
 
 
 @app.post("/auth/mfa/disable")
+# SECURITY FIX (fresh-pass audit, Aug 2026): same brute-force gap as
+# mfa_verify above — disabling MFA also only requires a 6-digit TOTP code
+# with no throttling. Same 10/minute limit as mfa_verify / mfa_challenge.
+@limiter.limit("10/minute")
 def mfa_disable(r: MfaCodeReq, request: Request):
     email = _require_session_user(request)
     x = ddb_get_user(email)
@@ -1372,7 +1633,12 @@ def auth_me(request: Request):
 
 
 @app.get("/auth/verification-status")
-def verification_status(email: str = ""):
+# SECURITY FIX (fresh-pass audit, Aug 2026): unrated -- the response-timing/shape
+# difference between an existing and non-existing account made this a lightweight
+# account-enumeration side channel. 20/minute is generous enough for the frontend's
+# own post-signup polling while ruling out bulk probing.
+@limiter.limit("20/minute")
+def verification_status(request: Request, email: str = ""):
     email = _norm_email(email)
     x = ddb_get_user(email)
     if not x:
@@ -1381,7 +1647,11 @@ def verification_status(email: str = ""):
 
 
 @app.post("/auth/resend-verification")
-def resend_verification(r: ResendVerify):
+# SECURITY FIX (fresh-pass audit, Aug 2026): unrated -- could be used to email-bomb
+# an address with verification emails. Matches /auth/register's 3/minute since both
+# trigger an outbound email per call.
+@limiter.limit("3/minute")
+def resend_verification(request: Request, r: ResendVerify):
     email = _norm_email(r.email)
     x = ddb_get_user(email)
     if x:
@@ -1398,6 +1668,15 @@ def resend_verification(r: ResendVerify):
 
 
 @app.post("/auth/change-email")
+# SECURITY FIX (fresh-pass audit, Aug 2026): this endpoint used to require nothing
+# beyond a valid session cookie. Combined with the forgot-password flow, that made
+# it an account-takeover primitive -- a compromised session (stolen cookie, shared
+# device, or the CSRF gap fixed above) could redirect the account's email address
+# and then take over the password-reset flow entirely. Now requires re-proof of
+# the CURRENT credential first: the TOTP code if MFA is enabled, otherwise the
+# current password. Rate-limited for the same reason mfa_verify/mfa_disable are --
+# an attacker holding a live session shouldn't be able to brute-force either check.
+@limiter.limit("5/minute")
 def change_email(request: Request, r: ChangeEmailReq):
     old = _require_session_user(request)
     new = _norm_email(r.new_email)
@@ -1406,6 +1685,12 @@ def change_email(request: Request, r: ChangeEmailReq):
     x = ddb_get_user(old)
     if not x:
         raise HTTPException(400, "Account not found")
+    if x.get("mfa_enabled"):
+        secret = _get_mfa_secret(x, old)
+        if not secret or not _mfa_verify_totp(secret, r.mfa_code):
+            raise HTTPException(401, "Current authentication code required")
+    elif not _verify_password(r.password, x.get("pw", "")):
+        raise HTTPException(401, "Current password required")
     if new != old and ddb_user_exists(new):
         raise HTTPException(400, "Email already in use")
     if new != old:
@@ -1434,22 +1719,14 @@ def auth_logout():
     return resp
 
 
-@app.get("/user/me")
-def me(user=Depends(get_user_from_token)):
-    return {
-        "email": user["email"],
-        "plan": user.get("plan", "starter"),
-        "name": user.get("name", ""),
-        "is_admin": _is_admin(user["email"]),
-    }
+# DEAD-CODE REMOVAL (fresh-pass audit, Aug 2026): GET /user/me and POST
+# /user/business-info removed with get_user_from_token() above -- see the note
+# there. /user/business-info was also a no-op (returned {"status":"saved"}
+# without persisting anything even while it existed), and neither route had
+# any caller in the frontend.
 
 
-@app.post("/user/business-info")
-def biz(user=Depends(get_user_from_token)):
-    return {"status": "saved"}
-
-
-def _check_expected_user(user_id, expected):
+def _check_expected_user(user_id, expected, ip=""):
     """PHASE 2.2 IDENTITY GUARD (D-1 countermeasure, Jul 2026).
 
     The July 3 "destroyed siblings" incident was a session identity flip: the
@@ -1468,7 +1745,7 @@ def _check_expected_user(user_id, expected):
         # identity mismatch is the exact signature of the D-1 incident class —
         # it deserves a permanent audit row, not just a 409 in an access log.
         _write_audit("identity.mismatch", user_id, _norm_email(str(expected)),
-                     "blocked", "expectedUser pin did not match session")
+                     "blocked", "expectedUser pin did not match session", ip=ip)
         raise HTTPException(
             409,
             "Session/account mismatch: this browser is signed in as a different "
@@ -1479,7 +1756,7 @@ def _check_expected_user(user_id, expected):
 @app.get("/records")
 def list_records(request: Request):
     user_id = _require_session_user(request)
-    _check_expected_user(user_id, request.headers.get("x-expected-user"))
+    _check_expected_user(user_id, request.headers.get("x-expected-user"), _client_ip(request))
     items = _ddb_query_records(user_id)
     out = [_record_from_item(it) for it in items]
     out.sort(key=lambda r: r.get("updatedAt", r.get("id", 0)), reverse=True)
@@ -1494,7 +1771,7 @@ async def upsert_record(request: Request):
         raise HTTPException(400, "Record must be a JSON object")
     # Identity guard — see _check_expected_user. Popped so the pin is transport
     # metadata, never persisted (writtenBySession/-Ip remain the forensics).
-    _check_expected_user(user_id, body.pop("expectedUser", None))
+    _check_expected_user(user_id, body.pop("expectedUser", None), _client_ip(request))
     record_id = body.get("id")
     if record_id is None:
         raise HTTPException(400, "Record id is required")
@@ -1516,7 +1793,7 @@ async def upsert_record(request: Request):
     # to reconstruct the event from access logs.
     raw_session = request.cookies.get(SESSION_COOKIE, "")
     item["writtenBySession"] = raw_session[:16] if raw_session else ""
-    item["writtenByIp"] = request.headers.get("x-forwarded-for", request.client.host if request.client else "")
+    item["writtenByIp"] = _client_ip(request)
     item["writtenAt"] = now
     _records_tbl.put_item(Item=_to_ddb(item))
     return _record_from_item(item)
@@ -1525,10 +1802,10 @@ async def upsert_record(request: Request):
 @app.delete("/records/{record_id}")
 def delete_record(record_id: int, request: Request):
     user_id = _require_session_user(request)
-    _check_expected_user(user_id, request.headers.get("x-expected-user"))
+    _check_expected_user(user_id, request.headers.get("x-expected-user"), _client_ip(request))
     existing = _records_tbl.get_item(Key={"userId": user_id, "recordId": record_id}).get("Item")
     if not existing:
-        _write_audit("record.delete", user_id, user_id, "not_found", f"recordId={record_id}")
+        _write_audit("record.delete", user_id, user_id, "not_found", f"recordId={record_id}", ip=_client_ip(request))
         raise HTTPException(404, "Record not found")
     _records_tbl.delete_item(Key={"userId": user_id, "recordId": record_id})
     # PHASE 4 (Jul-8 drill): record deletions previously left NO audit entry —
@@ -1536,7 +1813,8 @@ def delete_record(record_id: int, request: Request):
     # cost an hour of forensics instead of one table lookup. The record's name
     # rides in `detail` so the audit row alone answers "what was deleted".
     _write_audit("record.delete", user_id, user_id, "completed",
-                 f"recordId={record_id}; name={str(existing.get('name') or '')[:120]}")
+                 f"recordId={record_id}; name={str(existing.get('name') or '')[:120]}",
+                 ip=_client_ip(request))
     return {"ok": True}
 
 
@@ -1544,7 +1822,7 @@ def delete_record(record_id: int, request: Request):
 def delete_own_account(request: Request):
     """Account owner permanently deletes their own account."""
     email = _require_session_user(request)
-    result = _perform_account_deletion(email, actor_email=email)
+    result = _perform_account_deletion(email, actor_email=email, ip=_client_ip(request))
     resp = JSONResponse(result)
     _clear_session_cookie(resp)  # invalidate this session immediately
     return resp
@@ -1568,7 +1846,7 @@ def admin_delete_user(target_email: str, request: Request):
             "Admins can't delete their own account from the admin tool. "
             "Use Settings -> Delete account to remove your own account.",
         )
-    result = _perform_account_deletion(target, actor_email=actor)
+    result = _perform_account_deletion(target, actor_email=actor, ip=_client_ip(request))
     return JSONResponse(result)
 
 
@@ -1586,7 +1864,18 @@ def _stripe_route_error(exc, *, context):
 
 
 @app.post("/stripe/setup-intent")
-def setup():
+# SECURITY FIX (fresh-pass audit, Aug 2026): flagged as "unauthenticated and
+# unrated". IMPORTANT: this endpoint must STAY unauthenticated -- it's called
+# from the sign-up form (Onboarding.jsx submit()) BEFORE the account exists and
+# therefore before any session cookie exists, to collect card details as part
+# of one combined sign-up + payment-method step ahead of /auth/register. Adding
+# a session requirement here would break new-user sign-up entirely. The correct
+# half of the original finding to act on is the missing rate limit: without one,
+# anyone (not just real sign-ups) can call this repeatedly to create empty Stripe
+# SetupIntent objects at no benefit to them but at some cost/noise to the Stripe
+# account. 10/minute comfortably covers a real user retrying a card entry.
+@limiter.limit("10/minute")
+def setup(request: Request):
     try:
         i = stripe.SetupIntent.create(usage="off_session")
         return {"client_secret": i.client_secret}
@@ -1595,11 +1884,18 @@ def setup():
 
 
 @app.post("/stripe/subscribe")
+# SECURITY/PERF FIX (fresh-pass audit, Aug 2026, findings M-1/M-2): this route
+# had no rate limit -- every other Stripe-adjacent route does -- leaving it open
+# to card-testing-style abuse via the client-supplied payment_method_id (M-1).
+# It also looked up the current user via load()/full-table-scan, the exact
+# pattern every other route was already migrated away from, on the highest-
+# traffic, money-touching endpoint in the app (M-2). Both fixed the same way
+# every other authenticated route already does it.
+@limiter.limit("10/minute")
 def subscribe(r: Sub, request: Request):
     try:
         user = {"email": _require_session_user(request)}
-        u = load()
-        x = u.get(user["email"])
+        x = ddb_get_user(user["email"])
         if not x:
             raise HTTPException(404, "User not found")
         billing = r.billing if r.billing in ["monthly", "annual"] else "monthly"
@@ -2190,7 +2486,7 @@ def _exchange_oauth_code(provider, code):
         )
     elif provider == "freshbooks":
         return _freshbooks_token_exchange(o, secret, code)
-        else:
+    else:
         r = requests.post(
             TOKEN_URLS[provider],
             json={
@@ -2427,9 +2723,17 @@ def integration_data(request: Request, p: str, year: str = ""):
                 and (net is None or net == 0)
                 and summaries
             ):
-                out["debug_labels"] = [
-                    k for k in summaries.keys() if "::" not in k
-                ][:20]
+                # AUDIT FIX (fresh-eyes re-audit, Aug 2026): this diagnostic aid (Xero
+                # report section labels, for troubleshooting a zero-parse) was being
+                # attached directly to the JSON returned to the authenticated user --
+                # not sensitive (no financial figures), but a debug-only field that was
+                # never gated behind an env flag or removed. Log it server-side instead;
+                # the client response no longer carries it.
+                logger.warning(
+                    "xero profitloss parsed all-zero email=%s labels=%s",
+                    email,
+                    [k for k in summaries.keys() if "::" not in k][:20],
+                )
             return out
         if p == "wave":
             q1 = {"query": "{businesses(page:1,pageSize:1){edges{node{id}}}}"}
@@ -2446,10 +2750,18 @@ def integration_data(request: Request, p: str, year: str = ""):
             )
             if not bid:
                 return _pnl_result(0, 0)
+            # CODE-QUALITY FIX (fresh-pass audit, Aug 2026, finding L-2): bid comes
+            # from Wave's own API response, not user input, so this was never
+            # attacker-reachable -- but raw string concatenation into a GraphQL
+            # query is the wrong pattern regardless. Proper query variables now.
             q2 = {
                 "query": (
-                    "{business(id:\"" + bid + "\"){accounts{edges{node{subtype{name}balance}}}}}"
-                )
+                    "query($id: ID!) {"
+                    " business(id: $id) {"
+                    " accounts { edges { node { subtype { name } balance } } }"
+                    " } }"
+                ),
+                "variables": {"id": bid},
             }
             ar = requests.post(
                 "https://gql.waveapps.com/graphql/public",
@@ -2523,6 +2835,11 @@ def _require_minimum_plan(request: Request, minimum: str):
 
 
 @app.post("/aria")
+# COST-CONTROL FIX (fresh-pass audit, Aug 2026, finding L-1): the only rate limit
+# guarding this route used to be the professional-plan gate. A compromised
+# session (or just a plan-holder) could otherwise run up OpenAI billing with no
+# cap. 20/minute is generous for a real chat UI, tight enough to cap runaway cost.
+@limiter.limit("20/minute")
 async def aria_chat(request: Request):
     email, user, plan = _require_minimum_plan(request, "professional")
     if not OPENAI_API_KEY:
@@ -2657,12 +2974,42 @@ def reset_password(r: ResetReq, request: Request):
     x["pw"] = _hash_password(r.new_password)
     x.pop("reset_tok", None)
     x.pop("reset_exp", None)
-    x["tok"] = secrets.token_hex(32)
+    # SECURITY FIX (fresh-pass audit, Aug 2026, finding H-1): bump session_epoch
+    # so every session token issued before this reset -- however it was obtained,
+    # stolen cookie, shared device, anything -- stops validating immediately.
+    # This replaces an earlier, incorrect DEAD-CODE-REMOVAL comment that claimed
+    # sessions were "already invalidated on password reset via the normal
+    # session mechanism"; they were not -- the signed session token embedded
+    # nothing that a reset touched, so old sessions kept working for their full
+    # remaining life. See _make_session / _verify_session for the mechanism.
+    x["session_epoch"] = int(x.get("session_epoch", 0) or 0) + 1
     ddb_put_user(email, x)
     return {"ok": True}
 
 
-WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+def _resolve_webhook_secret():
+    """Resolve STRIPE_WEBHOOK_SECRET, failing closed unconditionally.
+
+    SECURITY FIX (independent review, Aug 2026): Stripe's signature is the ONLY
+    authentication /stripe/webhook has — it can't carry a session cookie or
+    bearer token, since Stripe calls it directly. The endpoint previously did
+    `if WEBHOOK_SECRET: verify(...)`, so a missing, mistyped, or not-yet-rotated
+    STRIPE_WEBHOOK_SECRET in production silently disabled verification instead
+    of blocking startup — anyone could then POST an arbitrary JSON body claiming
+    to be e.g. customer.subscription.updated for a known Stripe customer id and
+    upgrade that account to a paid plan for free (or cancel one). This mirrors
+    the STRIPE_SECRET_KEY check a few lines above in this file: fail closed,
+    always, with no environment-based carve-out — exactly like that key,
+    local/dev/test setups are expected to supply a real (test-mode) value via
+    .env / the test harness, same as STRIPE_SECRET_KEY already requires today.
+    """
+    secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+    if not secret:
+        raise RuntimeError("STRIPE_WEBHOOK_SECRET environment variable not set")
+    return secret
+
+
+WEBHOOK_SECRET = _resolve_webhook_secret()
 
 
 def _process_stripe_webhook_event(event):
@@ -2716,6 +3063,17 @@ async def stripe_webhook(request: Request):
     import json as _json
 
     try:
+        # CORRECTION (fresh-pass audit, Aug 2026): a first pass at this file
+        # called this `if WEBHOOK_SECRET:` guard dead code, since
+        # _resolve_webhook_secret() now fails closed at startup and
+        # WEBHOOK_SECRET can never be empty in production. That's true at
+        # runtime, but the guard is NOT dead: tests/test_stripe_webhook.py
+        # deliberately does `monkeypatch.setattr(main, "WEBHOOK_SECRET", "")`
+        # as a documented, intentional way to skip Stripe signature
+        # verification for webhook-processing tests that aren't testing
+        # signature verification itself (see that file's module docstring).
+        # Removing the guard broke six passing tests. Restored as-is — this
+        # is a real, load-bearing test seam, not leftover dead code.
         if WEBHOOK_SECRET:
             # Verify the signature (raises on tampering / mismatch). We deliberately
             # do NOT use its return value for processing: stripe.Webhook.construct_event

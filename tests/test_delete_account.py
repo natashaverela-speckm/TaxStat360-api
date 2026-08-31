@@ -212,3 +212,20 @@ def test_admin_cannot_self_delete_via_admin_route(client, main):
     r = client.delete(f"/admin/users/{admin}")
     assert r.status_code == 400, r.text
     assert main.ddb_get_user(admin) is not None
+
+
+# M-3 (fresh-pass audit, Aug 2026) -------------------------------------------
+def test_self_delete_audit_row_carries_source_ip(client, main):
+    """account.delete audit rows must record the requester's IP (M-3)."""
+    email = "ip-audit@example.com"
+    _mk_user(main, email)
+    _auth(client, main, email)
+
+    r = client.delete("/account", headers={"x-forwarded-for": "203.0.113.7, 10.0.0.1"})
+    assert r.status_code == 200, r.text
+
+    rows = [a for a in _audits_for(main, email) if a["action"] == "account.delete" and a["status"] == "completed"]
+    assert rows, "expected a completed account.delete audit row"
+    # _client_ip trusts only the LAST hop of X-Forwarded-For (the trusted proxy's
+    # own append), never the client-supplied first hop.
+    assert rows[-1]["ip"] == "10.0.0.1"
