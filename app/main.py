@@ -3171,11 +3171,12 @@ def _tax_1040_local_stub(file_name: str) -> dict:
 
 @app.post("/extract/tax-1040-carryforward")
 async def extract_tax_1040_carryforward(
+    request: Request,
     file: UploadFile = File(...),
     profile: str = Form("tax-1040-carryforward"),
-    user=Depends(require_plan("professional")),
 ):
     """Prefill carryforward wizard from prior-year PDF/image (HITL — review before save)."""
+    email, _user, _plan = _require_minimum_plan(request, "professional")
     if profile and profile != "tax-1040-carryforward":
         raise HTTPException(400, "Only profile tax-1040-carryforward is supported here.")
 
@@ -3191,7 +3192,7 @@ async def extract_tax_1040_carryforward(
     if not EXTRACT_SERVICE_KEY:
         logger.info(
             "extract tax-1040 local stub for %s file=%s",
-            user.get("email"),
+            email,
             fname,
         )
         return _tax_1040_local_stub(fname)
@@ -3236,7 +3237,7 @@ async def extract_tax_1040_carryforward(
 
     logger.info(
         "extract tax-1040 ok for %s file=%s",
-        user.get("email"),
+        email,
         fname,
     )
     return body
