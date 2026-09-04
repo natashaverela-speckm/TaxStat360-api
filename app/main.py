@@ -3117,6 +3117,14 @@ EXTRACT_SERVICE_KEY = os.environ.get("EXTRACT_SERVICE_KEY", "")
 EXTRACT_ANON_KEY = os.environ.get("EXTRACT_ANON_KEY", "") or os.environ.get(
     "SUPABASE_ANON_KEY", ""
 )
+# Phase 6 — tax PDFs stay on local stub until ZDR is confirmed in writing AND this is set.
+# EXTRACT_SERVICE_KEY alone (used by Remy receipts) must NOT send tax returns live.
+TAX_1040_LIVE_EXTRACT_ENABLED = os.environ.get("TAX_1040_LIVE_EXTRACT", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+TAX_1040_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 _TAX_1040_STUB_FIELDS = {
     "priorPassiveLossCarryforward": None,
@@ -3151,7 +3159,8 @@ def _tax_1040_local_stub(file_name: str) -> dict:
         else dict(_TAX_1040_STUB_FIELDS)
     )
     warnings = [
-        "Local API stub — set EXTRACT_DOCUMENT_URL + EXTRACT_SERVICE_KEY to call the shared engine.",
+        "Local API stub — tax-1040 stays stub until TAX_1040_LIVE_EXTRACT=true after ZDR confirmation "
+        "(and EXTRACT_SERVICE_KEY is set).",
         "Tax PDF is not stored in RepsRecord Evidence (delete-after-processing).",
         "Review every extracted figure before saving.",
     ]
@@ -3170,12 +3179,16 @@ def _tax_1040_local_stub(file_name: str) -> dict:
 
 
 @app.post("/extract/tax-1040-carryforward")
+# Phase 6 — cap runaway uploads / extract attempts (Professional session still required).
+@limiter.limit("10/minute")
 async def extract_tax_1040_carryforward(
     request: Request,
     file: UploadFile = File(...),
     profile: str = Form("tax-1040-carryforward"),
 ):
-    """Prefill carryforward wizard from prior-year PDF/image (HITL — review before save)."""
+    """Prefill carryforward wizard from prior-year text PDF (HITL — review before save)."""
+    from app.pdf_text_gate import gate_tax_1040_pdf_bytes
+
     email, _user, _plan = _require_minimum_plan(request, "professional")
     if profile and profile != "tax-1040-carryforward":
         raise HTTPException(400, "Only profile tax-1040-carryforward is supported here.")
@@ -3183,17 +3196,46 @@ async def extract_tax_1040_carryforward(
     raw = await file.read()
     if not raw:
         raise HTTPException(400, "Empty file.")
-    if len(raw) > 10 * 1024 * 1024:
-        raise HTTPException(400, "File exceeds 10 MB limit.")
+    if len(raw) > TAX_1040_MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "FILE_TOO_LARGE",
+                "message": "File exceeds 10 MB limit. Upload a smaller text PDF, or enter amounts manually.",
+            },
+        )
 
     fname = file.filename or "prior-year-1040.pdf"
     ctype = file.content_type or "application/pdf"
 
-    if not EXTRACT_SERVICE_KEY:
+    # Phase 3 — server gate (never trust browser alone). Log codes/counts only.
+    gate = gate_tax_1040_pdf_bytes(raw, filename=fname, content_type=ctype)
+    if not gate.get("ok"):
+        code = gate.get("code") or "PDF_UNREADABLE"
         logger.info(
-            "extract tax-1040 local stub for %s file=%s",
+            "extract tax-1040 gate reject code=%s alnum=%s file=%s user=%s",
+            code,
+            gate.get("alnum", 0),
+            fname,
+            email,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": code,
+                "message": gate.get("message") or "Upload rejected.",
+            },
+        )
+
+    # Phase 6 — stub unless both service key AND explicit live tax flag (ZDR gate).
+    if not EXTRACT_SERVICE_KEY or not TAX_1040_LIVE_EXTRACT_ENABLED:
+        logger.info(
+            "extract tax-1040 local stub for %s file=%s alnum=%s live=%s key=%s",
             email,
             fname,
+            gate.get("alnum", 0),
+            bool(TAX_1040_LIVE_EXTRACT_ENABLED),
+            bool(EXTRACT_SERVICE_KEY),
         )
         return _tax_1040_local_stub(fname)
 
@@ -3236,8 +3278,9 @@ async def extract_tax_1040_carryforward(
         logger.warning("stripped Evidence retention from tax-1040 extract response")
 
     logger.info(
-        "extract tax-1040 ok for %s file=%s",
+        "extract tax-1040 ok for %s file=%s alnum=%s",
         email,
         fname,
+        gate.get("alnum", 0),
     )
     return body
