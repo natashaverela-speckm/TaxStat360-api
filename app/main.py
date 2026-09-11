@@ -610,6 +610,13 @@ def _user_public(rec, email):
         "name": rec.get("name", ""),
         "verified": rec.get("verified", False),
         "is_admin": _is_admin(email),
+        # FRESH-EYES F-8/F-9 (11 Sep 2026): the accepted Terms/Privacy versions, so the
+        # client can compare against its current TERMS_VERSION at session hydrate and
+        # re-prompt when the documents have changed. Empty for accounts created before
+        # the assent record existed — the client treats empty as "must re-accept".
+        "terms_version": rec.get("terms_version", ""),
+        "privacy_version": rec.get("privacy_version", ""),
+        "terms_accepted_at": rec.get("terms_accepted_at", ""),
     }
 
 
@@ -1135,6 +1142,25 @@ class Reg(BaseModel):
     # client that omits the field still produces a correct (conservative) email.
     billing: str = "monthly"
     payment_method_id: str = ""
+    # FRESH-EYES F-8 (11 Sep 2026): THE ASSENT RECORD WAS NEVER STORED.
+    #
+    # Audit B5 (frontend c04) put a blocking clickwrap on signup and sent these four
+    # fields with the registration. This model did not declare them, so Pydantic
+    # dropped them silently and the user record written in register() carried no
+    # terms version, no acceptance timestamp, nothing. The checkbox worked; the
+    # proof that anyone ever checked it did not exist — for every account created
+    # since launch. A clickwrap defeats a challenge to formation (Nguyen v. Barnes &
+    # Noble) because you can produce the version accepted and when; Cal. Bus. & Prof.
+    # Code §17602(b) puts the burden of proving auto-renewal consent on the seller.
+    #
+    # Optional with empty defaults so an older client that omits them still
+    # registers; register() logs a WARNING when they are absent so a regression on
+    # the frontend is visible. Do NOT remove these fields to "fix" a 4xx — they are
+    # the assent record.
+    terms_version: str = ""
+    privacy_version: str = ""
+    terms_accepted_at: str = ""
+    auto_renewal_accepted_at: str = ""
 
 
 class Log(BaseModel):
@@ -1470,8 +1496,34 @@ def register(r: Reg, request: Request):
         "verify_tok": verify_tok,
         "verify_exp": int(time.time()) + VERIFY_TTL,
         "session_epoch": 0,  # H-1 fix: bumped on password reset to revoke old sessions
+        # FRESH-EYES F-8 (11 Sep 2026): the clickwrap assent record. See the Reg model
+        # for why this exists. Stored on the user record for /auth/me-style lookups AND
+        # as an append-only audit row below, so it survives account deletion — the
+        # dispute that needs this evidence most is the one filed after the customer
+        # has left.
+        "terms_version": (r.terms_version or "")[:32],
+        "privacy_version": (r.privacy_version or "")[:32],
+        "terms_accepted_at": (r.terms_accepted_at or "")[:40],
+        "auto_renewal_accepted_at": (r.auto_renewal_accepted_at or "")[:40],
+        "terms_accepted_ip": _client_ip(request),
+        "terms_accepted_plan": plan,
+        "terms_accepted_billing": (r.billing or "monthly")[:16],
     }
     ddb_put_user(email, rec)
+    if not r.terms_version or not r.terms_accepted_at:
+        # A signup arrived without the assent fields. Either an old client or a
+        # frontend regression that dropped them; either way this account has no
+        # provable acceptance and someone should know.
+        logger.warning("TERMS_ASSENT_MISSING email=%s terms_version=%r accepted_at=%r",
+                       email, r.terms_version, r.terms_accepted_at)
+    _write_audit(
+        "terms.accept", email, email, "completed",
+        detail=(f"terms={r.terms_version or '-'} privacy={r.privacy_version or '-'} "
+                f"accepted_at={r.terms_accepted_at or '-'} "
+                f"auto_renewal_at={r.auto_renewal_accepted_at or '-'} "
+                f"plan={plan} billing={r.billing or 'monthly'}"),
+        ip=_client_ip(request),
+    )
     mc_subscribe(email, r.name)
     try:
         _send_verification_email(email, verify_tok)
@@ -1630,6 +1682,48 @@ def auth_me(request: Request):
         if x:
             return _user_public(x, email)
     raise HTTPException(401, "Not authenticated")
+
+
+class AcceptTerms(BaseModel):
+    terms_version: str
+    privacy_version: str = ""
+    accepted_at: str = ""
+
+
+@app.post("/auth/accept-terms")
+@limiter.limit("10/minute")
+def accept_terms(r: AcceptTerms, request: Request):
+    """FRESH-EYES F-9 (11 Sep 2026): re-acceptance after a Terms/Privacy change.
+
+    Terms §13 promises notice of material changes and §11(h) starts the arbitration
+    opt-out clock from "first accepting these Terms" — neither is meaningful without
+    a re-prompt when the version moves. The client compares /auth/me's terms_version
+    to its current TERMS_VERSION and, on mismatch (or empty, for pre-F-8 accounts),
+    shows a fresh checkbox and posts here. Same shape of record as registration:
+    on the user row for lookup, and an append-only audit row for evidence.
+    """
+    email = _require_session_user(request)
+    x = ddb_get_user(email)
+    if not x:
+        raise HTTPException(401, "Not authenticated")
+    tv = (r.terms_version or "").strip()[:32]
+    if not tv:
+        raise HTTPException(400, "terms_version is required")
+    accepted_at = (r.accepted_at or "").strip()[:40] or time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+    )
+    x["terms_version"] = tv
+    if r.privacy_version:
+        x["privacy_version"] = r.privacy_version.strip()[:32]
+    x["terms_accepted_at"] = accepted_at
+    x["terms_accepted_ip"] = _client_ip(request)
+    ddb_put_user(email, x)
+    _write_audit(
+        "terms.reaccept", email, email, "completed",
+        detail=f"terms={tv} privacy={x.get('privacy_version', '-')} accepted_at={accepted_at}",
+        ip=_client_ip(request),
+    )
+    return {"ok": True, "terms_version": tv, "terms_accepted_at": accepted_at}
 
 
 @app.get("/auth/verification-status")
@@ -1881,6 +1975,38 @@ def setup(request: Request):
         return {"client_secret": i.client_secret}
     except Exception as e:
         _stripe_route_error(e, context="stripe setup-intent")
+
+
+@app.post("/stripe/portal")
+@limiter.limit("10/minute")
+def stripe_portal(request: Request):
+    """FRESH-EYES F-18 (11 Sep 2026): a billing-portal session for the SIGNED-IN customer.
+
+    Settings opened the portal's generic login link, so cancelling meant: leave the
+    app → new tab → retype your email → go to your inbox → retrieve a one-time code →
+    return → cancel. Signing up was four fields and two ticks. ROSCA 15 U.S.C.
+    §8403(3) requires a "simple mechanism"; Cal. Bus. & Prof. Code §17602(c) requires
+    cancellation without steps that obstruct or delay. An out-of-band verification
+    the signup flow never demanded is a delay step. A portal SESSION created for the
+    authenticated customer opens the portal already signed in.
+
+    ⚠ The portal only shows a cancel control if "Cancel subscriptions" is enabled in
+    the Stripe Customer Portal configuration (Dashboard → Settings → Billing →
+    Customer portal). That switch is a launch blocker, not a code comment.
+    """
+    email = _require_session_user(request)
+    x = ddb_get_user(email)
+    cid = (x or {}).get("stripe_customer_id", "") if x else ""
+    if not cid:
+        raise HTTPException(404, "No billing account on file for this user")
+    try:
+        sess = stripe.billing_portal.Session.create(
+            customer=cid,
+            return_url=f"{FRONTEND_URL}/settings",
+        )
+        return {"url": sess.url}
+    except Exception as e:
+        _stripe_route_error(e, context="stripe portal")
 
 
 @app.post("/stripe/subscribe")
