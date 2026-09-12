@@ -2152,7 +2152,7 @@ ARIA_SYSTEM = (
     "\u2022 2026 figures (Rev. Proc. 2025-32): standard deduction $16,100 single / $32,200 MFJ / "
     "$24,150 HOH; 37% bracket begins at $640,600 single / $768,700 MFJ; long-term capital gains "
     "0% band tops at $49,450 single / $98,900 MFJ, 20% above $545,500 / $613,700.\n"
-    "\u2022 \u00a7199A QBI: 20% deduction, PERMANENT (OBBBA); 2026 thresholds $201,775 single / "
+    "\u2022 \u00a7199A QBI: 20% deduction, PERMANENT (OBBBA); 2026 thresholds $201,750 single (MFS $201,775) / "
     "$403,500 MFJ; $75K/$150K phase-in ranges; $400 minimum deduction; SSTB benefit fully "
     "phased out above threshold + phase-in.\n"
     "\u2022 SALT cap 2026 (OBBBA \u00a770120): $40,400 ($20,200 MFS), reduced by 30% of MAGI over "
