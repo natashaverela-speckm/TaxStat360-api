@@ -74,6 +74,49 @@ sudo systemctl is-active taxstat360.service
 
 Do **not** leave the service stopped.
 
+## 4b. Security headers (nginx) — one-time, re-check after any nginx change
+
+The five security headers on `app.taxstat360.com` are added by nginx in front of
+gunicorn, not by `app/main.py` (12 Sep 2026 closeout, R-4). Two items from the 14 Sep
+fourth read are still open on the box:
+
+- `Server: nginx/1.24.0 (Ubuntu)` advertises the version — set `server_tokens off;`
+- `Strict-Transport-Security: max-age=31536000` lacks `includeSubDomains`
+
+In the `server { listen 443 ssl; server_name app.taxstat360.com; ... }` block of the
+site config (usually `/etc/nginx/sites-available/taxstat360`, or wherever
+`grep -rl app.taxstat360.com /etc/nginx` points), make the header block read exactly:
+
+```nginx
+server_tokens off;
+
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+add_header X-Frame-Options "DENY" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header X-Permitted-Cross-Domain-Policies "none" always;
+```
+
+Notes:
+- `always` makes nginx send the headers on 4xx/5xx responses too (without it, a 404 or
+  a 429 from the rate limiter goes out bare).
+- `add_header` directives are NOT inherited into a `location {}` block that declares its
+  own `add_header` — keep them at `server` level, or repeat the full set inside any
+  `location` that adds one.
+- `includeSubDomains` on `app.taxstat360.com` only governs `*.app.taxstat360.com`; it
+  does not touch `www.` or the apex, which are served by Amplify/CloudFront with their
+  own `customHttp.yml` headers.
+- Do NOT also add these headers in `app/main.py`: nginx `add_header` appends rather
+  than replaces, and RFC 6797 §8.1 says a browser processes only the FIRST HSTS header
+  it sees — duplicates are at best noise and at worst the weaker one.
+
+Then:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+BASE=https://app.taxstat360.com bash scripts/smoke_check.sh   # now also checks the headers
+```
+
 ## 5. Smoke tests
 
 > **Required regression guard — run after every restart.** A deploy is not complete until this passes:
