@@ -46,9 +46,29 @@ echo "Backup TS=$TS"
 
 **Option A — from GitHub (after merging to `main`):**
 
+The clone at `/home/ubuntu/risk-planner-BE` tracks `origin/main` over SSH. The deploy key is the
+`ubuntu` user's (`/home/ubuntu/.ssh/id_ed25519`); `root` has none, so a plain `git pull` inside
+`sudo -i` fails with `Permission denied (publickey)` (14 Sep 2026). Point git at that key for
+the shell session — nothing is written to root's config:
+
 ```bash
 cd /home/ubuntu/risk-planner-BE
-sudo -u ubuntu git pull origin main   # only if repo is cloned here; skip if hand-copying
+export GIT_SSH_COMMAND="ssh -i /home/ubuntu/.ssh/id_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/ubuntu/.ssh/known_hosts"
+git status --short          # must be clean apart from `?? logs/` — see note below
+git pull --ff-only
+git rev-parse --short HEAD  # should match the commit on GitHub
+```
+
+If `git status` shows ` M app/main.py` (a file was hand-copied on the server during an earlier
+deploy), discard the local copy FIRST or the pull will refuse: `git checkout -- app/main.py`.
+The pull then brings the committed version.
+
+**Upload-path check.** When files are added through GitHub's "Add file → Upload files" page,
+they land in the folder that was open at the time. A `main.py` uploaded at the repo root is
+NOT the served file — gunicorn runs `app/main.py`. After the pull, confirm:
+
+```bash
+ls main.py 2>/dev/null && echo "WRONG PLACE: main.py at repo root — move it to app/ on GitHub"
 ```
 
 **Option B — copy `app/main.py` via Session Manager** (paste or upload), then:
@@ -265,7 +285,17 @@ curl -si "https://app.taxstat360.com/integrations/quickbooks/callback" | head -8
 
 After a successful deploy, commit the same `app/main.py` to `natashaverela-speckm/taxstat360-api` on `main` (or PR).
 
-## Rollback
+To move a file that was uploaded to the wrong folder (e.g. `main.py` at the root that belongs
+at `app/main.py`): open the file on GitHub → pencil (Edit) → in the filename box at the top
+change `main.py` to `app/main.py` → "Commit changes" to `main`. GitHub treats the path edit as
+a move and replaces the existing `app/main.py`.
+
+## Rollback — ONLY if step 4 or 5 failed
+
+Run this only when the service is not `active` or the smoke check printed `SMOKE CHECK FAILED`.
+It restores the file saved in step 1 and restarts on it — running it after a PASSED check
+silently undoes the deploy (this happened twice on 14 Sep 2026). Keep it out of any block you
+paste together with the deploy commands.
 
 ```bash
 sudo cp /home/ubuntu/backups/taxstat360_YYYYMMDD_HHMMSS_main.py /home/ubuntu/risk-planner-BE/app/main.py
