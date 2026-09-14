@@ -45,3 +45,62 @@ def test_niche_scorp_and_real_estate_rules_present():
 
 def test_unknown_figures_deferred_to_tax_tracker():
     assert "Tax Tracker" in ARIA_SYSTEM
+
+
+# FOURTH READ (14 Sep 2026): the server-side copy of the frontend GROUNDING RULES.
+# The 12 Sep closeout relied on the frontend sending the rules with every turn; this
+# pins a backend copy so a client that omits them still gets a grounded model.
+
+def test_grounding_rules_present_server_side():
+    assert "GROUNDING RULES" in ARIA_SYSTEM
+    for n in range(1, 12):
+        assert f"\n{n}. " in ARIA_SYSTEM, f"rule {n} missing"
+
+
+def test_no_arithmetic_and_no_memory_figures():
+    assert "Do NOT perform tax arithmetic" in ARIA_SYSTEM
+    assert "from memory" in ARIA_SYSTEM
+
+
+def test_fabricated_authority_rule():
+    # 11 Sep HARD FAIL: the model summarised a court case that does not exist.
+    assert "cannot confirm what that authority says" in ARIA_SYSTEM
+    assert "Never state what a court held" in ARIA_SYSTEM
+
+
+def test_nonexistent_rule_is_named_as_nonexistent():
+    assert "SAY IT DOES NOT EXIST" in ARIA_SYSTEM
+    assert "no percentage safe harbour" in ARIA_SYSTEM
+    assert "§1.162-7" in ARIA_SYSTEM
+
+
+def test_not_modeled_list_covers_the_limitations_page():
+    # Mirrors the FAQ "What does TaxStat360 not calculate?" and closes the D3 wobble
+    # ("I cannot confirm whether any deduction for your age was applied").
+    for marker in (
+        "DOES NOT MODEL",
+        "senior deduction",
+        "NEVER applied",
+        "not that you cannot confirm",
+        "tips, overtime or car-loan interest",
+        "§163(j)",
+        "§531",
+        "§541",
+        "NOT capped",
+    ):
+        assert marker in ARIA_SYSTEM, marker
+
+
+def test_no_audit_framing_rule():
+    assert "audit risk" in ARIA_SYSTEM
+    assert "never use those phrases" in ARIA_SYSTEM
+
+
+def test_why_questions_answered_only_from_limitation_lines():
+    assert "limitation lines" in ARIA_SYSTEM
+    assert "Tax Waterfall" in ARIA_SYSTEM
+
+
+def test_prompt_stays_within_a_sane_token_budget():
+    # Guard against the brief growing until it crowds out the 900-token reply budget.
+    assert len(ARIA_SYSTEM) < 12000
