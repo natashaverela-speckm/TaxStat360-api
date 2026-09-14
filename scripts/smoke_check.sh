@@ -9,13 +9,17 @@
 #
 # Usage:  bash scripts/smoke_check.sh [BASE_URL]
 #         BASE=https://app.taxstat360.com bash scripts/smoke_check.sh
-#         BASE_URL defaults to http://127.0.0.1:8000 (run on the EC2 box).
-# FOURTH READ (14 Sep 2026): the argument form and the BASE= env form are both accepted.
+#         BASE_URL=https://app.taxstat360.com bash scripts/smoke_check.sh
+#         The target defaults to http://127.0.0.1:8000 (run on the EC2 box).
+# FOURTH READ (14 Sep 2026): the argument form and the env forms are all accepted.
 # Previously only $1 was read, so the env form the runbook documents silently fell back
 # to localhost — and, once the header check landed, silently skipped it (caught live on
-# the 14 Sep deploy). Argument wins if both are given.
+# the 14 Sep deploy). Argument wins, then BASE, then BASE_URL (third pass: the usage line
+# said BASE_URL, so that spelling is honored too). A trailing slash is stripped so
+# "https://app.taxstat360.com/" does not become ".com//aria".
 set -u
-BASE="${1:-${BASE:-http://127.0.0.1:8000}}"
+BASE="${1:-${BASE:-${BASE_URL:-http://127.0.0.1:8000}}}"
+BASE="${BASE%/}"
 fail=0
 
 check() {
@@ -27,6 +31,11 @@ check() {
   fi
   if [ "$code" = "404" ]; then
     echo "FAIL  $method $path -> 404 (route NOT registered)"
+    fail=1
+  elif [ "$code" = "000" ]; then
+    # Third pass (14 Sep 2026): curl reports 000 when it never got an HTTP answer at all
+    # (refused, DNS, TLS, timeout). That used to print as "ok" because it is not a 404.
+    echo "FAIL  $method $path -> no HTTP response (connection failed)"
     fail=1
   else
     echo "ok    $method $path -> $code"
@@ -51,11 +60,13 @@ case "$BASE" in
   *)
     hdrs=$(curl -s -m 10 -D - -o /dev/null "$BASE/auth/me"); rc=$?
     if [ "$rc" -ne 0 ]; then
+      # Third pass (14 Sep 2026): one FAIL line for the unreachable edge, not one per header.
       echo "FAIL  could not reach $BASE/auth/me (curl exit $rc) — cannot verify security headers"
       fail=1
       hdrs=""
     fi
     need_header() {
+      if [ -z "$hdrs" ]; then return 0; fi
       name="$1"; pattern="$2"
       if printf '%s' "$hdrs" | grep -i "^$name:" | grep -qiE "$pattern"; then
         echo "ok    header $name"
@@ -64,15 +75,27 @@ case "$BASE" in
         fail=1
       fi
     }
-    need_header "strict-transport-security" "max-age=31536000.*includeSubDomains"
+    # HSTS: any max-age of one year (31536000) or more satisfies the policy — a two-year
+    # 63072000 must not fail (third-pass review), so the value is compared numerically
+    # rather than pattern-matched. includeSubDomains is still required.
+    if [ -n "$hdrs" ]; then
+      hsts=$(printf '%s' "$hdrs" | grep -i "^strict-transport-security:" | head -n1)
+      hsts_age=$(printf '%s' "$hsts" | grep -oiE "max-age=[0-9]+" | head -n1 | cut -d= -f2)
+      if [ -n "$hsts_age" ] && [ "$hsts_age" -ge 31536000 ] && printf '%s' "$hsts" | grep -qi "includeSubDomains"; then
+        echo "ok    header strict-transport-security (max-age=$hsts_age; includeSubDomains)"
+      else
+        echo "FAIL  header strict-transport-security missing or wrong (want max-age >= 31536000 and includeSubDomains; got: ${hsts:-<none>})"
+        fail=1
+      fi
+    fi
     need_header "x-frame-options" "DENY"
     need_header "x-content-type-options" "nosniff"
     need_header "referrer-policy" "strict-origin-when-cross-origin"
     need_header "x-permitted-cross-domain-policies" "none"
-    if printf '%s' "$hdrs" | grep -i "^server:" | grep -qE "[0-9]+\.[0-9]+"; then
+    if [ -n "$hdrs" ] && printf '%s' "$hdrs" | grep -i "^server:" | grep -qE "[0-9]+\.[0-9]+"; then
       echo "FAIL  Server header advertises a version (set server_tokens off)"
       fail=1
-    else
+    elif [ -n "$hdrs" ]; then
       echo "ok    Server header carries no version"
     fi
     ;;
