@@ -8,9 +8,14 @@
 # a dropped route fails the deploy loudly instead of reaching users.
 #
 # Usage:  bash scripts/smoke_check.sh [BASE_URL]
+#         BASE=https://app.taxstat360.com bash scripts/smoke_check.sh
 #         BASE_URL defaults to http://127.0.0.1:8000 (run on the EC2 box).
+# FOURTH READ (14 Sep 2026): the argument form and the BASE= env form are both accepted.
+# Previously only $1 was read, so the env form the runbook documents silently fell back
+# to localhost — and, once the header check landed, silently skipped it (caught live on
+# the 14 Sep deploy). Argument wins if both are given.
 set -u
-BASE="${1:-http://127.0.0.1:8000}"
+BASE="${1:-${BASE:-http://127.0.0.1:8000}}"
 fail=0
 
 check() {
@@ -40,9 +45,16 @@ check GET "/records"
 # never sees nginx). Fails on a missing header, a missing includeSubDomains, or a
 # version string in Server. See docs/EC2-DEPLOY.md §4b.
 case "$BASE" in
-  http://127.0.0.1*|http://localhost*) echo "skip  security-header check (local target bypasses nginx)";;
+  # Anchored: host must be exactly 127.0.0.1 / localhost / [::1] / 0.0.0.0, optionally with a port.
+  http://127.0.0.1|http://127.0.0.1:*|http://localhost|http://localhost:*|http://0.0.0.0|http://0.0.0.0:*|"http://[::1]"|"http://[::1]:"*)
+    echo "skip  security-header check (local target bypasses nginx)";;
   *)
-    hdrs=$(curl -s -m 10 -D - -o /dev/null "$BASE/auth/me")
+    hdrs=$(curl -s -m 10 -D - -o /dev/null "$BASE/auth/me"); rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "FAIL  could not reach $BASE/auth/me (curl exit $rc) — cannot verify security headers"
+      fail=1
+      hdrs=""
+    fi
     need_header() {
       name="$1"; pattern="$2"
       if printf '%s' "$hdrs" | grep -i "^$name:" | grep -qiE "$pattern"; then
