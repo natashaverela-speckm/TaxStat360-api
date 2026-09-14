@@ -34,8 +34,40 @@ check GET "/auth/verification-status?email=probe@example.com"
 check GET "/auth/me"
 check GET "/records"
 
+# FOURTH READ (14 Sep 2026): the security headers live in nginx, not in the app, so
+# nothing in pytest can protect them. Check them at the public edge on every deploy
+# (skipped for the default localhost target, which talks to gunicorn directly and
+# never sees nginx). Fails on a missing header, a missing includeSubDomains, or a
+# version string in Server. See docs/EC2-DEPLOY.md §4b.
+case "$BASE" in
+  http://127.0.0.1*|http://localhost*) echo "skip  security-header check (local target bypasses nginx)";;
+  *)
+    hdrs=$(curl -s -m 10 -D - -o /dev/null "$BASE/auth/me")
+    need_header() {
+      name="$1"; pattern="$2"
+      if printf '%s' "$hdrs" | grep -i "^$name:" | grep -qiE "$pattern"; then
+        echo "ok    header $name"
+      else
+        echo "FAIL  header $name missing or wrong (want /$pattern/)"
+        fail=1
+      fi
+    }
+    need_header "strict-transport-security" "max-age=31536000.*includeSubDomains"
+    need_header "x-frame-options" "DENY"
+    need_header "x-content-type-options" "nosniff"
+    need_header "referrer-policy" "strict-origin-when-cross-origin"
+    need_header "x-permitted-cross-domain-policies" "none"
+    if printf '%s' "$hdrs" | grep -i "^server:" | grep -qE "[0-9]+\.[0-9]+"; then
+      echo "FAIL  Server header advertises a version (set server_tokens off)"
+      fail=1
+    else
+      echo "ok    Server header carries no version"
+    fi
+    ;;
+esac
+
 if [ "$fail" -ne 0 ]; then
-  echo "SMOKE CHECK FAILED: a critical route is missing. Do not treat this deploy as healthy."
+  echo "SMOKE CHECK FAILED: a critical route is missing or a security header is wrong. Do not treat this deploy as healthy."
   exit 1
 fi
-echo "SMOKE CHECK PASSED: all critical routes registered."
+echo "SMOKE CHECK PASSED: all critical routes registered and security headers present."
