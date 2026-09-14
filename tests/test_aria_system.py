@@ -68,6 +68,13 @@ def test_fabricated_authority_rule():
     assert "Never state what a court held" in ARIA_SYSTEM
 
 
+def test_rule_7_carve_out_names_the_rules_that_cite_authorities():
+    # Third pass (14 Sep 2026): rule 9 names §163(j), §531, §541, §168(k) and §179. Without
+    # the carve-out, rule 7 ("do NOT characterise ANY legal authority ... unless its text is
+    # in the message") contradicts rule 9's instruction to say those items are not modeled.
+    assert "in rules 8 and 9 of this message may be relied on" in ARIA_SYSTEM
+
+
 def test_nonexistent_rule_is_named_as_nonexistent():
     assert "SAY IT DOES NOT EXIST" in ARIA_SYSTEM
     assert "no percentage safe harbour" in ARIA_SYSTEM
