@@ -32,10 +32,11 @@ def test_require_plan_symbol_removed(main):
     assert not hasattr(main, "require_plan")
 
 
-def test_plan_order_still_present_for_require_minimum_plan(main):
-    # PLAN_ORDER itself must survive -- _require_minimum_plan (the route guard
-    # actually used by /aria, cpa-briefing, etc.) still depends on it.
-    assert main.PLAN_ORDER == ["starter", "professional", "enterprise"]
+def test_single_plan_model(main):
+    # PHASE 1b (Nov 2026): one plan. The tiered guard is gone with the tiers.
+    assert main.PLAN_ORDER == ["starter", "pro"]
+    assert not hasattr(main, "_require_minimum_plan")
+    assert not hasattr(main, "LEGACY_PRICE_IDS")
 
 
 def test_register_rejects_malformed_email(client, main):

@@ -30,6 +30,9 @@ os.environ.update(
         "AWS_DEFAULT_REGION": "us-east-1",
         "LOG_DIR": "/tmp/taxstat360-test-logs",
         "SESSION_COOKIE_DOMAIN": "",
+        # PHASE 1b: the one plan's Stripe prices, so purchase + webhook tests have a price to use
+        "STRIPE_PRICE_PRO_MONTHLY": "price_test_pro_monthly",
+        "STRIPE_PRICE_PRO_ANNUAL": "price_test_pro_annual",
     }
 )
 

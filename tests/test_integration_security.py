@@ -23,7 +23,7 @@ def _mk_user(main, email):
             "name": "Sec Test",
             "pw": main._hash_password("TestPassword123!"),
             "tok": "tok_" + email,
-            "plan": "professional",
+            "plan": "pro",
             "stripe_customer_id": "",
             "verified": True,
         },

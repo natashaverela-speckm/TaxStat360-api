@@ -70,7 +70,7 @@ def test_subscribe_missing_user_returns_404_not_400(client, main):
             "/stripe/subscribe",
             json={
                 "email": email,
-                "plan": "professional",
+                "plan": "pro",
                 "payment_method_id": "pm_card_visa",
                 "billing": "monthly",
             },
@@ -93,7 +93,7 @@ def test_subscribe_stripe_error_does_not_leak_exception_text(client, main):
             "/stripe/subscribe",
             json={
                 "email": email,
-                "plan": "professional",
+                "plan": "pro",
                 "payment_method_id": "pm_card_visa",
                 "billing": "monthly",
             },

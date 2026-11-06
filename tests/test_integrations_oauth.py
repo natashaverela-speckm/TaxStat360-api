@@ -7,7 +7,7 @@ def _mk_user(main, email, **extra):
         "name": "Integ Test",
         "pw": main._hash_password("TestPassword123!"),
         "tok": "tok_" + email,
-        "plan": "professional",
+        "plan": "pro",
         "verified": True,
     }
     rec.update(extra)
