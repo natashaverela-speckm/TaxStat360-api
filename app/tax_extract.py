@@ -52,7 +52,7 @@ REVIEW_FIELDS: list[tuple[str, str, str]] = [
     ("schedCGross", "number", "Schedule C line 1 gross receipts (sum if several Schedules C)"),
     ("schedCNet", "number", "Schedule C line 31 net profit or loss (sum if several; losses negative)"),
     ("k1ScorpOrdinary", "number", "Schedule K-1 (Form 1120-S) box 1 ordinary business income (loss), summed across S-Corp K-1s; a loss, printed in parentheses or with a minus sign, is negative. If only Schedule E Part II line 28 is available: column (k) is income (positive) and columns (g) and (i) are LOSSES, so an amount in column (i) must be returned as a negative number even though it is printed without a sign. Never Schedule E line 32, 41 or 43, which combine other items"),
-    ("k1PartnershipOrdinary", "number", "Schedule K-1 (Form 1065) box 1 ordinary business income (loss), summed across partnership K-1s; a loss, usually printed in parentheses, is negative"),
+    ("k1PartnershipOrdinary", "number", "Schedule K-1 (Form 1065) box 1 ordinary business income (loss), summed across partnership K-1s, or Schedule E Part II line 28 rows marked P in column (b) (columns (g)/(i) are losses, negative). Null when the only K-1 is from an S corporation (an S in column (b)); never copy the S-Corp figure here"),
     ("interestIncome", "number", "Form 1040 line 2b taxable interest"),
     ("dividends", "number", "Form 1040 line 3b ordinary dividends"),
     ("qualifiedDividends", "number", "Form 1040 line 3a qualified dividends"),
@@ -242,6 +242,8 @@ def _system_prompt(profile: str) -> str:
         "4. Return nothing but the JSON object. Do not include names, addresses, or identification numbers.\n"
         "5. Checkboxes: a label appearing in the text does not mean its box is checked. Only a mark "
         "beside the label, a '[checked: ...]' note, or a figure elsewhere on the return that implies it counts.\n"
+        "6. One figure belongs to one field. Never place the same amount in two fields that describe "
+        "different things (for example an S-Corp K-1 and a partnership K-1); when a figure fits only one, the other is null.\n"
         f"Fields:\n{lines}"
     )
 
