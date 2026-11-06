@@ -84,6 +84,7 @@ def test_only_masked_text_is_sent_never_bytes():
     assert "123-45-6789" not in user_msg
     assert sent["json"]["response_format"]["type"] == "json_schema"
     assert sent["json"]["temperature"] == 0
+    assert sent["json"]["store"] is False   # never stored in the org's dashboard logs
     assert sent["headers"]["Authorization"] == "Bearer sk-x"
     assert sent["url"] == tx.OPENAI_CHAT_URL
 

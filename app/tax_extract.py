@@ -206,6 +206,9 @@ def extract_fields_from_text(
     payload = {
         "model": model,
         "temperature": 0,
+        # Never let OpenAI keep this request in the organization's dashboard logs,
+        # whatever the org-level "API call logging" setting says.
+        "store": False,
         "messages": [
             {"role": "system", "content": _system_prompt(profile)},
             {"role": "user", "content": body},
