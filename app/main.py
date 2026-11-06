@@ -1118,7 +1118,17 @@ def mc_subscribe(email, name=""):
 # with it (see below) since neither had any caller.
 #
 # PLAN_ORDER is still used by _require_minimum_plan() below and stays.
-PLAN_ORDER = ["starter", "professional", "enterprise"]
+PLAN_ORDER = ["starter", "professional", "enterprise", "pro"]
+
+# PHASE 1b (single plan, Nov 2026). TaxStat360 ships as ONE plan, "pro" (sold as
+# Toolkit Pro from the Tax Strategies Toolkit side). The three legacy tiers stay
+# defined so (a) existing Stripe subscriptions keep mapping back to a plan in the
+# webhook and (b) nothing deployed breaks before the new Stripe prices exist.
+# "starter" remains what a cancelled / lapsed subscription falls back to (see the
+# webhook), so it is treated as NO paid plan: every feature gate below asks for a
+# paid plan, not a tier. A legacy Professional or Enterprise account therefore has
+# everything a Pro account has, and the Enterprise-only report gates are gone.
+FULL_ACCESS_PLANS = frozenset({"pro", "professional", "enterprise"})
 
 
 # INPUT-HYGIENE FIX (fresh-pass audit, Aug 2026): email fields across the API were
@@ -1175,13 +1185,31 @@ class Sub(BaseModel):
     billing: str = "monthly"
 
 
-PRICE_IDS = {
+# Legacy tiers: archive these prices in Stripe (do not delete) once Pro is live, so
+# the webhook can still resolve an existing subscriber's plan from the price id.
+LEGACY_PRICE_IDS = {
     "starter": {"monthly": "price_1TJmmDGUoj1XrJQjbArxsVDy", "annual": "price_1TO5zWGUoj1XrJQjcWpQmMnC"},
     "professional": {"monthly": "price_1TJmmwGUoj1XrJQjZp897iCJ", "annual": "price_1TO60pGUoj1XrJQjhU4R9yGQ"},
     "enterprise": {"monthly": "price_1TJmnKGUoj1XrJQjfgrOhAlC", "annual": "price_1TO62FGUoj1XrJQjtcbNym1Z"},
 }
 
-VALID_PLANS = set(PRICE_IDS.keys())
+# PHASE 1b: the one live plan. Price ids come from the environment so the Stripe
+# products can be created (and rotated) without a deploy. Until BOTH are set, "pro"
+# is not purchasable through /stripe/subscribe (it falls back to "starter" exactly
+# as an unknown plan id always has) and the webhook cannot map to it — set
+# STRIPE_PRICE_PRO_MONTHLY and STRIPE_PRICE_PRO_ANNUAL on the box before launch.
+STRIPE_PRICE_PRO_MONTHLY = os.environ.get("STRIPE_PRICE_PRO_MONTHLY", "").strip()
+STRIPE_PRICE_PRO_ANNUAL = os.environ.get("STRIPE_PRICE_PRO_ANNUAL", "").strip()
+PRO_PRICE_CONFIGURED = bool(STRIPE_PRICE_PRO_MONTHLY and STRIPE_PRICE_PRO_ANNUAL)
+
+PRICE_IDS = dict(LEGACY_PRICE_IDS)
+if PRO_PRICE_CONFIGURED:
+    PRICE_IDS["pro"] = {"monthly": STRIPE_PRICE_PRO_MONTHLY, "annual": STRIPE_PRICE_PRO_ANNUAL}
+
+# A plan id a client may send. "pro" is always a valid plan NAME (an account can be
+# put on it by the webhook or by hand); whether it can be BOUGHT here depends on the
+# price ids above.
+VALID_PLANS = set(LEGACY_PRICE_IDS.keys()) | {"pro"}
 ALLOWED_PROVIDERS = {"quickbooks", "freshbooks", "xero", "wave"}
 
 # --- Integration credentials (audit P0-#1) ------------------------------------
@@ -1413,6 +1441,14 @@ PLAN_PRICES = {
     "starter":      {"monthly": 79,  "annual_total": 790,  "label": "Starter"},
     "professional": {"monthly": 149, "annual_total": 1490, "label": "Professional"},
     "enterprise":   {"monthly": 299, "annual_total": 2990, "label": "Enterprise"},
+    # PHASE 1b: the one live plan. Amounts are what the trial-confirmation email
+    # states, so they MUST match the Stripe prices named by STRIPE_PRICE_PRO_*.
+    # Overridable without a deploy for the same reason the price ids are.
+    "pro": {
+        "monthly": int(os.environ.get("PRO_PRICE_MONTHLY", "39") or 39),
+        "annual_total": int(os.environ.get("PRO_PRICE_ANNUAL", "399") or 399),
+        "label": os.environ.get("PRO_PLAN_LABEL", "Toolkit Pro") or "Toolkit Pro",
+    },
 }
 
 
@@ -2136,6 +2172,34 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 # outside the brief. ANNUAL MAINTENANCE: update the figures below together with the
 # frontend TAX_TABLES (src/taxCalc.js) and the Aria.jsx guard facts each January.
 ARIA_MODEL = os.environ.get("ARIA_MODEL", "gpt-4o-mini")
+# PHASE 1b: per-user monthly message cap. Aria is included in the one plan; on
+# gpt-4o-mini a reply costs a fraction of a cent, so this is insurance against a
+# runaway client, not a metering tier. 0 disables the cap.
+ARIA_MONTHLY_CAP = int(os.environ.get("ARIA_MONTHLY_CAP", "200") or 0)
+
+
+def _aria_month_key(now=None):
+    now = now or datetime.now(timezone.utc)
+    return now.strftime("%Y-%m")
+
+
+def _aria_usage_this_month(user):
+    usage = user.get("aria_usage") or {}
+    try:
+        return int(usage.get(_aria_month_key(), 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _aria_record_use(email, user):
+    """Increment this month's count on the user record; older months are dropped."""
+    key = _aria_month_key()
+    usage = dict(user.get("aria_usage") or {})
+    count = _aria_usage_this_month(user) + 1
+    usage = {key: count}
+    user["aria_usage"] = usage
+    ddb_put_user(email, user)
+    return count
 ARIA_SYSTEM = (
     "You are Aria, the TaxStat360 AI tax strategist. Help business owners with federal tax "
     "planning, estimated payments, entity structure, deductions, and compliance-aware guidance. "
@@ -3005,6 +3069,21 @@ def integration_data(request: Request, p: str, year: str = ""):
         raise HTTPException(500, "Provider request failed")
     raise HTTPException(404)
 
+def _require_paid_plan(request: Request):
+    """PHASE 1b: session + ANY paid plan (DynamoDB plan is source of truth).
+
+    Replaces the tiered floors on Aria, the return-extract endpoint and the two
+    report gates. "starter" is the lapsed/cancelled fallback, so it is refused;
+    pro / professional / enterprise all pass.
+    """
+    email = _require_session_user(request)
+    user = ddb_get_user(email) or {}
+    plan = user.get("plan", "starter")
+    if plan not in FULL_ACCESS_PLANS:
+        raise HTTPException(403, "An active TaxStat360 plan is required")
+    return email, user, plan
+
+
 def _require_minimum_plan(request: Request, minimum: str):
     """Session-required plan floor (DynamoDB plan is source of truth)."""
     email = _require_session_user(request)
@@ -3027,7 +3106,12 @@ def _require_minimum_plan(request: Request, minimum: str):
 # cap. 20/minute is generous for a real chat UI, tight enough to cap runaway cost.
 @limiter.limit("20/minute")
 async def aria_chat(request: Request):
-    email, user, plan = _require_minimum_plan(request, "professional")
+    email, user, plan = _require_paid_plan(request)
+    if ARIA_MONTHLY_CAP and _aria_usage_this_month(user) >= ARIA_MONTHLY_CAP:
+        raise HTTPException(
+            429,
+            f"Aria's monthly limit of {ARIA_MONTHLY_CAP} messages is used up for this account; it resets next month.",
+        )
     if not OPENAI_API_KEY:
         raise HTTPException(503, "Aria service unavailable")
     body = await request.json()
@@ -3061,25 +3145,29 @@ async def aria_chat(request: Request):
         logger.warning("aria openai: %s %s", r.status_code, r.text[:300])
         raise HTTPException(503, "Aria service unavailable")
     reply = r.json()["choices"][0]["message"]["content"]
-    return {"reply": reply}
+    used = _aria_record_use(email, user) if ARIA_MONTHLY_CAP else None
+    out = {"reply": reply}
+    if used is not None:
+        out["usage"] = {"used": used, "cap": ARIA_MONTHLY_CAP}
+    return out
 
 
 @app.post("/reports/cpa-briefing/authorize")
 def authorize_cpa_briefing(request: Request):
-    """Enterprise-only gate before CPA Briefing generation.
+    """Paid-plan gate before CPA Briefing generation (was Enterprise-only; PHASE 1b).
 
     The briefing document is assembled client-side from the user's saved
     figures; this endpoint is the server-side entitlement check so a
     Professional account cannot bypass the upsell UI and still generate it.
     """
-    email, _user, plan = _require_minimum_plan(request, "enterprise")
+    email, _user, plan = _require_paid_plan(request)   # PHASE 1b: any paid plan
     return {"ok": True, "feature": "cpa-briefing", "plan": plan, "email": email}
 
 
 @app.post("/reports/position-docs/authorize")
 def authorize_position_docs(request: Request):
-    """Enterprise-only gate for Position Documentation / IRS notice templates."""
-    email, _user, plan = _require_minimum_plan(request, "enterprise")
+    """Paid-plan gate for Position Documentation (was Enterprise-only; PHASE 1b)."""
+    email, _user, plan = _require_paid_plan(request)   # PHASE 1b: any paid plan
     return {"ok": True, "feature": "position-docs", "plan": plan, "email": email}
 
 
@@ -3375,7 +3463,7 @@ async def extract_tax_1040_carryforward(
     """Prefill carryforward wizard from prior-year text PDF (HITL — review before save)."""
     from app.pdf_text_gate import gate_tax_1040_pdf_bytes
 
-    email, _user, _plan = _require_minimum_plan(request, "professional")
+    email, _user, _plan = _require_paid_plan(request)
     if profile and profile != "tax-1040-carryforward":
         raise HTTPException(400, "Only profile tax-1040-carryforward is supported here.")
 

@@ -35,7 +35,7 @@ def test_require_plan_symbol_removed(main):
 def test_plan_order_still_present_for_require_minimum_plan(main):
     # PLAN_ORDER itself must survive -- _require_minimum_plan (the route guard
     # actually used by /aria, cpa-briefing, etc.) still depends on it.
-    assert main.PLAN_ORDER == ["starter", "professional", "enterprise"]
+    assert main.PLAN_ORDER == ["starter", "professional", "enterprise", "pro"]
 
 
 def test_register_rejects_malformed_email(client, main):
