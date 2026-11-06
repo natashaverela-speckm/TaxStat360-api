@@ -32,10 +32,14 @@ def test_cpa_briefing_authorize_blocks_starter(client, main):
     assert "plan" in (r.json().get("detail") or "").lower()
 
 
-def test_cpa_briefing_authorize_refuses_retired_tiers(client, main):
+def test_cpa_briefing_authorize_reads_retired_tiers_as_pro(client, main):
+    # Accounts created under the old tiers (staff accounts among them) are the one
+    # plan now; the stored name is rewritten on their next login.
     for tier in ("professional", "enterprise"):
         _session_user(client, main, f"{tier}@example.com", plan=tier)
-        assert client.post("/reports/cpa-briefing/authorize").status_code == 403
+        r = client.post("/reports/cpa-briefing/authorize")
+        assert r.status_code == 200
+        assert r.json()["plan"] == "pro"
 
 
 def test_cpa_briefing_authorize_allows_pro(client, main):

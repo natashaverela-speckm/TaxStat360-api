@@ -606,7 +606,7 @@ def _clear_session_cookie(response):
 def _user_public(rec, email):
     return {
         "email": email,
-        "plan": rec.get("plan", "starter"),
+        "plan": _effective_plan(rec, email),
         "name": rec.get("name", ""),
         "verified": rec.get("verified", False),
         "is_admin": _is_admin(email),
@@ -1066,8 +1066,12 @@ def _complete_login(email, x):
     # See that removal note for the full trace.
     x.pop("mfa_login_token", None)
     x.pop("mfa_login_exp", None)
+    # Single plan: rewrite a retired tier name (or a staff account) to "pro" on
+    # login so the stored record matches what every gate reads.
+    plan = _effective_plan(x, email)
+    if plan == "pro" and x.get("plan") != "pro":
+        x["plan"] = "pro"
     ddb_put_user(email, x)
-    plan = x.get("plan", "starter")
     session_token = _make_session(email)
     resp = JSONResponse({
         "ok": True,
@@ -1126,6 +1130,20 @@ def mc_subscribe(email, name=""):
 # are gone; delete those six prices in Stripe.
 PLAN_ORDER = ["starter", "pro"]
 FULL_ACCESS_PLANS = frozenset({"pro"})
+# Accounts created under the retired tiers (and staff accounts) carry old plan names
+# in DynamoDB. They are all the one plan now; the frontend aliases the same names.
+LEGACY_PAID_PLANS = frozenset({"professional", "enterprise", "expert", "elite", "essential"})
+
+
+def _effective_plan(user, email=None):
+    """The plan every gate reads: 'pro' or 'starter'. Legacy paid tiers and admin
+    accounts are 'pro'; anything else is 'starter' (no subscription)."""
+    raw = str((user or {}).get("plan", "starter") or "starter").strip().lower()
+    if raw in FULL_ACCESS_PLANS or raw in LEGACY_PAID_PLANS:
+        return "pro"
+    if email and _is_admin(email):
+        return "pro"
+    return "starter"
 
 
 # INPUT-HYGIENE FIX (fresh-pass audit, Aug 2026): email fields across the API were
@@ -3066,7 +3084,7 @@ def _require_paid_plan(request: Request):
     """
     email = _require_session_user(request)
     user = ddb_get_user(email) or {}
-    plan = user.get("plan", "starter")
+    plan = _effective_plan(user, email)
     if plan not in FULL_ACCESS_PLANS:
         raise HTTPException(403, "An active TaxStat360 plan is required")
     return email, user, plan
