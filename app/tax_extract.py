@@ -197,7 +197,10 @@ PNL_FIELDS: list[tuple[str, str, str]] = [
     ("depreciation", "number", "depreciation expense line; null if none"),
     ("rentExpense", "number", "rent or lease expense line; null if none"),
     ("interestExpense", "number", "interest expense line; null if none"),
-    ("netIncome", "number", "Net Income / Net Operating Income / Net Profit line (losses negative)"),
+    ("otherIncome", "number", "Total Other Income line (the section below Net Operating Income: affiliate income, interest, other income); null if the report has no such section"),
+    ("otherExpenses", "number", "Total Other Expenses line (the section below Net Operating Income); null if the report has no such section"),
+    ("netOperatingIncome", "number", "Net Operating Income line, before other income and other expenses; null if not shown"),
+    ("netIncome", "number", "the final Net Income / Net Profit line at the bottom of the report, after other income and other expenses (losses negative)"),
 ]
 
 PROFILES: dict[str, list[tuple[str, str, str]]] = {
