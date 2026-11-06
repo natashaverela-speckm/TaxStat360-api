@@ -181,12 +181,32 @@ CCORP_FIELDS: list[tuple[str, str, str]] = [
     ("homeOfficeOrAccountablePlan", "boolean", "true if the other-deductions statement shows a line for office-in-home, accountable plan, or employee expense reimbursement"),
 ]
 
+# ── Profit & loss export (simple flow) ────────────────────────────────────────
+# A P&L exported from QuickBooks, Xero, Wave or FreshBooks, read so the member
+# never types the numbers. Totals only; no customer or vendor names are asked for.
+PNL_FIELDS: list[tuple[str, str, str]] = [
+    ("periodLabel", "string", "the reporting period printed under the report title, as written (for example 'January 1 - October 31, 2026'); null if not shown"),
+    ("periodYear", "integer", "the calendar year the period ends in"),
+    ("totalIncome", "number", "Total Income / Total Revenue / Total Sales line (before cost of goods sold)"),
+    ("costOfGoodsSold", "number", "Total Cost of Goods Sold / Cost of Sales; null if the report has no such section"),
+    ("grossProfit", "number", "Gross Profit line; null if not shown"),
+    ("totalExpenses", "number", "Total Expenses / Total Operating Expenses line (all expenses below gross profit, including payroll)"),
+    ("officerCompensation", "number", "officer compensation / owner salary / shareholder wages line, if any; null if no such line"),
+    ("wagesOther", "number", "other payroll wages or salaries lines (not officers), summed; null if none"),
+    ("payrollTaxes", "number", "payroll tax expense lines, summed; null if none"),
+    ("depreciation", "number", "depreciation expense line; null if none"),
+    ("rentExpense", "number", "rent or lease expense line; null if none"),
+    ("interestExpense", "number", "interest expense line; null if none"),
+    ("netIncome", "number", "Net Income / Net Operating Income / Net Profit line (losses negative)"),
+]
+
 PROFILES: dict[str, list[tuple[str, str, str]]] = {
     "tax-1040-review": REVIEW_FIELDS,
     "tax-1040-carryforward": CARRYFORWARD_FIELDS,
     "tax-1120s-review": SCORP_FIELDS,
     "tax-1065-review": PARTNERSHIP_FIELDS,
     "tax-1120-review": CCORP_FIELDS,
+    "pnl-summary": PNL_FIELDS,
 }
 
 _DOCUMENT_KIND = {
@@ -195,6 +215,7 @@ _DOCUMENT_KIND = {
     "tax-1120s-review": "United States S corporation income tax return (Form 1120-S package with Schedules K, K-1, L, M-2 and Form 4562)",
     "tax-1065-review": "United States partnership return of income (Form 1065 package with Schedules K, K-1, L and Form 4562)",
     "tax-1120-review": "United States corporation income tax return (Form 1120 package with Schedules L, M-1, M-2, Form 1125-E and Form 4562)",
+    "pnl-summary": "profit and loss statement exported from accounting software such as QuickBooks, Xero, Wave or FreshBooks",
 }
 
 
