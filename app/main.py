@@ -3431,7 +3431,7 @@ _TAX_FIXTURE_FIELDS = {
 # whole 1040 package for the review memo. The key list is the contract shared with
 # the frontend (src/lib/priorYearReview.js TAX_1040_REVIEW_FIELDS) and the extract
 # service; change it in all three places together. Same gates, same retention rule.
-EXTRACT_PROFILES = ("tax-1040-carryforward", "tax-1040-review", "tax-1120s-review", "tax-1065-review", "tax-1120-review")
+EXTRACT_PROFILES = ("tax-1040-carryforward", "tax-1040-review", "tax-1120s-review", "tax-1065-review", "tax-1120-review", "pnl-summary")
 TAX_1040_REVIEW_FIELD_KEYS = [
     "taxYear", "filingStatus", "dependents",
     "w2Wages", "w2Withheld", "officerW2",
@@ -3486,6 +3486,12 @@ _TAX_1120_FIXTURE_FIELDS = {
     "loansToShareholders": None, "loansFromShareholders": None, "retainedEarnings": 310000, "totalAssets": 480000,
     "vehicleOrTravel": 14000, "homeOfficeOrAccountablePlan": False,
 }
+_PNL_FIXTURE_FIELDS = {
+    "periodLabel": "January 1 - October 31, 2026", "periodYear": 2026,
+    "totalIncome": 300000, "costOfGoodsSold": None, "grossProfit": 300000,
+    "totalExpenses": 186120, "officerCompensation": 80000, "wagesOther": None, "payrollTaxes": 6120,
+    "depreciation": None, "rentExpense": 24000, "interestExpense": None, "netIncome": 113880,
+}
 _TAX_1065_FIXTURE_FIELDS = {
     "taxYear": 2025, "partnerCount": 2,
     "grossReceipts": 310000, "totalIncome": 310000,
@@ -3502,10 +3508,10 @@ def _tax_1040_local_stub(file_name: str, profile: str = "tax-1040-carryforward")
     name = (file_name or "").lower()
     if profile == "tax-1040-review":
         fields = dict(_TAX_REVIEW_FIXTURE_FIELDS) if _TAX_FIXTURE_TOKEN in name else dict(_TAX_REVIEW_STUB_FIELDS)
-    elif profile in ("tax-1120s-review", "tax-1065-review", "tax-1120-review"):
+    elif profile in ("tax-1120s-review", "tax-1065-review", "tax-1120-review", "pnl-summary"):
         from app.tax_extract import field_keys
 
-        fixture = {"tax-1120s-review": _TAX_1120S_FIXTURE_FIELDS, "tax-1065-review": _TAX_1065_FIXTURE_FIELDS, "tax-1120-review": _TAX_1120_FIXTURE_FIELDS}[profile]
+        fixture = {"tax-1120s-review": _TAX_1120S_FIXTURE_FIELDS, "tax-1065-review": _TAX_1065_FIXTURE_FIELDS, "tax-1120-review": _TAX_1120_FIXTURE_FIELDS, "pnl-summary": _PNL_FIXTURE_FIELDS}[profile]
         fields = dict(fixture) if ("fixture-tax-" in name and "smoke" in name) else {k: None for k in field_keys(profile)}
     else:
         fields = (

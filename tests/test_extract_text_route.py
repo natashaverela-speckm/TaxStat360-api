@@ -75,7 +75,7 @@ def test_image_only_empty_and_oversize_are_refused(client, main):
 def test_entity_profiles_are_registered_and_schema_strict(main):
     import app.tax_extract as tx
 
-    for profile in ("tax-1120s-review", "tax-1065-review", "tax-1120-review"):
+    for profile in ("tax-1120s-review", "tax-1065-review", "tax-1120-review", "pnl-summary"):
         assert profile in main.EXTRACT_PROFILES
         keys = tx.field_keys(profile)
         assert len(keys) == len(set(keys))
@@ -92,7 +92,7 @@ def test_entity_profiles_are_registered_and_schema_strict(main):
     assert "corporation income tax return" in tx._system_prompt("tax-1120-review")
 
 
-@pytest.mark.parametrize("profile,fixture_key", [("tax-1120s-review", "officerCompensation"), ("tax-1065-review", "guaranteedPayments"), ("tax-1120-review", "dividendsPaid")])
+@pytest.mark.parametrize("profile,fixture_key", [("tax-1120s-review", "officerCompensation"), ("tax-1065-review", "guaranteedPayments"), ("tax-1120-review", "dividendsPaid"), ("pnl-summary", "totalIncome")])
 def test_entity_stub_returns_fixture_when_hinted_else_nulls(client, main, monkeypatch, profile, fixture_key):
     monkeypatch.setattr(main, "TAX_1040_LIVE_EXTRACT_ENABLED", False)
     _session_pro(client, main)
