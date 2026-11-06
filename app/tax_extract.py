@@ -143,11 +143,39 @@ PARTNERSHIP_FIELDS: list[tuple[str, str, str]] = [
     ("vehicleOrTravel", "number", "the sum of any 'auto', 'vehicle', 'travel' or 'meals' lines on the other-deductions statement; null if no such statement"),
 ]
 
+CCORP_FIELDS: list[tuple[str, str, str]] = [
+    ("taxYear", "integer", "the tax year printed at the top of Form 1120"),
+    ("grossReceipts", "number", "Form 1120 line 1a gross receipts or sales"),
+    ("totalIncome", "number", "Form 1120 line 11 total income"),
+    ("officerCompensation", "number", "Form 1120 line 12 compensation of officers (Form 1125-E total)"),
+    ("salariesWages", "number", "Form 1120 line 13 salaries and wages, excluding officers"),
+    ("rentsPaid", "number", "Form 1120 line 16 rents"),
+    ("taxesAndLicenses", "number", "Form 1120 line 17 taxes and licenses"),
+    ("charitableContributions", "number", "Form 1120 line 19 charitable contributions"),
+    ("depreciation", "number", "Form 1120 line 20 depreciation"),
+    ("sec179", "number", "Form 4562 line 12 section 179 expense deduction; null if Form 4562 is not in the package"),
+    ("bonusDepreciation", "number", "Form 4562 line 14 special depreciation allowance; null if Form 4562 is not in the package"),
+    ("pensionProfitSharing", "number", "Form 1120 line 23 pension, profit-sharing, etc., plans"),
+    ("employeeBenefits", "number", "Form 1120 line 24 employee benefit programs"),
+    ("otherDeductions", "number", "Form 1120 line 26 other deductions"),
+    ("totalDeductions", "number", "Form 1120 line 27 total deductions"),
+    ("taxableIncome", "number", "Form 1120 line 30 taxable income (losses negative)"),
+    ("totalTax", "number", "Form 1120 line 31 total tax"),
+    ("dividendsPaid", "number", "Schedule M-2 line 5 distributions (cash dividends paid to shareholders); null if Schedule M-2 is not completed"),
+    ("loansToShareholders", "number", "Schedule L line 7 loans to shareholders, end of year"),
+    ("loansFromShareholders", "number", "Schedule L line 19 loans from shareholders, end of year"),
+    ("retainedEarnings", "number", "Schedule L line 25 retained earnings, end of year"),
+    ("totalAssets", "number", "Schedule L line 15 total assets, end of year; null if Schedule L is not completed"),
+    ("vehicleOrTravel", "number", "the sum of any 'auto', 'vehicle', 'travel' or 'meals' lines on the other-deductions statement; null if no such statement"),
+    ("homeOfficeOrAccountablePlan", "boolean", "true if the other-deductions statement shows a line for office-in-home, accountable plan, or employee expense reimbursement"),
+]
+
 PROFILES: dict[str, list[tuple[str, str, str]]] = {
     "tax-1040-review": REVIEW_FIELDS,
     "tax-1040-carryforward": CARRYFORWARD_FIELDS,
     "tax-1120s-review": SCORP_FIELDS,
     "tax-1065-review": PARTNERSHIP_FIELDS,
+    "tax-1120-review": CCORP_FIELDS,
 }
 
 _DOCUMENT_KIND = {
@@ -155,6 +183,7 @@ _DOCUMENT_KIND = {
     "tax-1040-carryforward": "United States federal individual income tax return (Form 1040 package)",
     "tax-1120s-review": "United States S corporation income tax return (Form 1120-S package with Schedules K, K-1, L, M-2 and Form 4562)",
     "tax-1065-review": "United States partnership return of income (Form 1065 package with Schedules K, K-1, L and Form 4562)",
+    "tax-1120-review": "United States corporation income tax return (Form 1120 package with Schedules L, M-1, M-2, Form 1125-E and Form 4562)",
 }
 
 
