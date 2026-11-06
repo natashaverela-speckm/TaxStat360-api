@@ -3472,7 +3472,7 @@ _TAX_1120S_FIXTURE_FIELDS = {
     "officerCompensation": 80000, "salariesWages": 96000, "rentsPaid": 24000, "taxesAndLicenses": 13460,
     "depreciation": 6200, "sec179": None, "bonusDepreciation": None,
     "pensionProfitSharing": None, "employeeBenefits": None, "otherDeductions": 86460, "totalDeductions": 306120,
-    "ordinaryBusinessIncome": 113880, "shareholderHealthIns": None,
+    "ordinaryBusinessIncome": 113880, "shareholderHealthIns": None, "nondeductibleExpenses": None, "nondeductibleHealthIns": None,
     "distributions": 95000, "loansToShareholders": None, "loansFromShareholders": None, "totalAssets": 148000,
     "vehicleOrTravel": 9800, "homeOfficeOrAccountablePlan": False,
 }
