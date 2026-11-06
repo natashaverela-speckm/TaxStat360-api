@@ -3368,6 +3368,16 @@ EXTRACT_ANON_KEY = os.environ.get("EXTRACT_ANON_KEY", "") or os.environ.get(
 )
 # Phase 6 — tax PDFs stay on local stub until ZDR is confirmed in writing AND this is set.
 # EXTRACT_SERVICE_KEY alone (used by Remy receipts) must NOT send tax returns live.
+# PHASE 2 option B (Nov 2026): where the live extract runs.
+#   "openai" (default) — TaxStat360's own extractor (app/tax_extract.py): the text
+#            layer, SSNs masked, goes to OpenAI with a strict JSON schema under the
+#            account's own key. Tax documents never touch RepsRecord's project.
+#   "edge"  — the shared RepsRecord extract-document Edge Function (legacy path).
+# Either way nothing is live until TAX_1040_LIVE_EXTRACT=true, which the operator
+# sets only after zero-data-retention terms are confirmed in writing for the
+# provider in use.
+TAX_EXTRACT_PROVIDER = (os.environ.get("TAX_EXTRACT_PROVIDER", "openai").strip().lower() or "openai")
+TAX_EXTRACT_MODEL = os.environ.get("TAX_EXTRACT_MODEL", "gpt-4o").strip() or "gpt-4o"
 TAX_1040_LIVE_EXTRACT_ENABLED = os.environ.get("TAX_1040_LIVE_EXTRACT", "").strip().lower() in (
     "1",
     "true",
@@ -3517,17 +3527,45 @@ async def extract_tax_1040_carryforward(
             },
         )
 
-    # Phase 6 — stub unless both service key AND explicit live tax flag (ZDR gate).
-    if not EXTRACT_SERVICE_KEY or not TAX_1040_LIVE_EXTRACT_ENABLED:
+    # Phase 6 — stub unless the live tax flag is set (ZDR gate) AND the chosen
+    # provider is configured (OpenAI key for "openai", service key for "edge").
+    provider_ready = bool(OPENAI_API_KEY) if TAX_EXTRACT_PROVIDER == "openai" else bool(EXTRACT_SERVICE_KEY)
+    if not provider_ready or not TAX_1040_LIVE_EXTRACT_ENABLED:
         logger.info(
-            "extract tax-1040 local stub for %s file=%s alnum=%s live=%s key=%s",
+            "extract tax-1040 local stub for %s file=%s alnum=%s live=%s provider=%s ready=%s",
             email,
             fname,
             gate.get("alnum", 0),
             bool(TAX_1040_LIVE_EXTRACT_ENABLED),
-            bool(EXTRACT_SERVICE_KEY),
+            TAX_EXTRACT_PROVIDER,
+            provider_ready,
         )
         return _tax_1040_local_stub(fname, profile)
+
+    # PHASE 2 option B: native extractor. Only the gated text layer leaves the box,
+    # SSN-masked; the PDF bytes are discarded with this request.
+    if TAX_EXTRACT_PROVIDER == "openai":
+        from app.tax_extract import extract_fields_from_text, ExtractError
+
+        try:
+            body = extract_fields_from_text(
+                gate.get("text") or "",
+                profile,
+                api_key=OPENAI_API_KEY,
+                model=TAX_EXTRACT_MODEL,
+            )
+        except ExtractError as e:
+            logger.warning("extract tax-1040 native failed for %s file=%s: %s", email, fname, e)
+            raise HTTPException(503, "The return could not be read right now. Enter the figures manually or try again later.")
+        logger.info(
+            "extract tax-1040 native ok for %s file=%s alnum=%s found=%s model=%s",
+            email,
+            fname,
+            gate.get("alnum", 0),
+            body["providerMeta"].get("fieldsFound"),
+            TAX_EXTRACT_MODEL,
+        )
+        return body
 
     # Forward multipart to shared extract-document (service auth — no Evidence write).
     try:

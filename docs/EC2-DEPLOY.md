@@ -302,6 +302,22 @@ sudo cp /home/ubuntu/backups/taxstat360_YYYYMMDD_HHMMSS_main.py /home/ubuntu/ris
 sudo systemctl restart taxstat360.service
 ```
 
+## Prior-Year Review extractor (PHASE 2, option B — Nov 2026)
+
+TaxStat360 reads prior-year returns itself (`app/tax_extract.py`): the gated,
+SSN-masked text layer goes to OpenAI with a strict JSON schema under this
+account's `OPENAI_API_KEY`. The PDF bytes never leave the box and are discarded
+with the request. Nothing is live until the operator sets the flag.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `TAX_EXTRACT_PROVIDER` | `openai` | `openai` = native extractor; `edge` = the shared RepsRecord Edge Function (legacy) |
+| `TAX_EXTRACT_MODEL` | `gpt-4o` | OpenAI model for extraction (accuracy matters more than cost here; a return costs a few cents) |
+| `TAX_1040_LIVE_EXTRACT` | unset (off) | `true` switches from the local stub to the live provider — set ONLY after zero-data-retention terms are confirmed in writing for the provider |
+| `OPENAI_API_KEY` | (Aria's) | reused for extraction when the provider is `openai` |
+
+Frontend: `VITE_PRIOR_YEAR_REVIEW=true` on the Amplify build shows the review tile.
+
 ## Notes
 
 - `ensure_pw.sh` resets `admin@taxstat360.com` in **users.json** only; auth reads **DynamoDB**. Update admin password in DynamoDB separately if needed.
