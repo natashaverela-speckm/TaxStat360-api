@@ -3399,14 +3399,51 @@ _TAX_FIXTURE_FIELDS = {
 }
 
 
-def _tax_1040_local_stub(file_name: str) -> dict:
+# PHASE 2 (Prior-Year Review, Nov 2026): a second, wider profile that reads the
+# whole 1040 package for the review memo. The key list is the contract shared with
+# the frontend (src/lib/priorYearReview.js TAX_1040_REVIEW_FIELDS) and the extract
+# service; change it in all three places together. Same gates, same retention rule.
+EXTRACT_PROFILES = ("tax-1040-carryforward", "tax-1040-review")
+TAX_1040_REVIEW_FIELD_KEYS = [
+    "taxYear", "filingStatus", "dependents",
+    "w2Wages", "w2Withheld", "officerW2",
+    "schedCGross", "schedCNet", "k1ScorpOrdinary", "k1PartnershipOrdinary",
+    "schedEPropertyCount", "schedERent", "schedEExpenses", "schedEDepreciation",
+    "rentalBuildingBasis", "shortTermRental",
+    "depreciationTotal", "sec179", "qbiDeduction", "selfEmpRetirement", "hsaDeduction",
+    "selfEmpHealthIns", "homeOfficeClaimed",
+    "agi", "totalTax", "estimatedPaymentsMade", "underpaymentPenalty",
+    "priorPassiveLossCarryforward", "capLossCarryforwardST", "capLossCarryforwardLT",
+    "nolCarryforward", "priorYearQBILoss",
+]
+# Sample figures for the review stub (filename containing `fixture-tax-1040-smoke`):
+# an MFJ S-Corp owner with one rental — the walkthrough return.
+_TAX_REVIEW_FIXTURE_FIELDS = {
+    "taxYear": 2025, "filingStatus": "mfj", "dependents": 2,
+    "w2Wages": 180000, "w2Withheld": 20000, "officerW2": 80000,
+    "schedCGross": None, "schedCNet": None, "k1ScorpOrdinary": 113880, "k1PartnershipOrdinary": None,
+    "schedEPropertyCount": 1, "schedERent": 42000, "schedEExpenses": 30000, "schedEDepreciation": 28000,
+    "rentalBuildingBasis": 400000, "shortTermRental": False,
+    "depreciationTotal": 28000, "sec179": None, "qbiDeduction": 18500, "selfEmpRetirement": None,
+    "hsaDeduction": None, "selfEmpHealthIns": None, "homeOfficeClaimed": False,
+    "agi": 262000, "totalTax": 43199, "estimatedPaymentsMade": 12000, "underpaymentPenalty": 612,
+    "priorPassiveLossCarryforward": 9000, "capLossCarryforwardST": None, "capLossCarryforwardLT": None,
+    "nolCarryforward": None, "priorYearQBILoss": None,
+}
+_TAX_REVIEW_STUB_FIELDS = {k: None for k in TAX_1040_REVIEW_FIELD_KEYS}
+
+
+def _tax_1040_local_stub(file_name: str, profile: str = "tax-1040-carryforward") -> dict:
     """Dev fallback when EXTRACT_SERVICE_KEY is not configured."""
     name = (file_name or "").lower()
-    fields = (
-        dict(_TAX_FIXTURE_FIELDS)
-        if _TAX_FIXTURE_TOKEN in name
-        else dict(_TAX_1040_STUB_FIELDS)
-    )
+    if profile == "tax-1040-review":
+        fields = dict(_TAX_REVIEW_FIXTURE_FIELDS) if _TAX_FIXTURE_TOKEN in name else dict(_TAX_REVIEW_STUB_FIELDS)
+    else:
+        fields = (
+            dict(_TAX_FIXTURE_FIELDS)
+            if _TAX_FIXTURE_TOKEN in name
+            else dict(_TAX_1040_STUB_FIELDS)
+        )
     warnings = [
         "Local API stub — tax-1040 stays stub until TAX_1040_LIVE_EXTRACT=true after ZDR confirmation "
         "(and EXTRACT_SERVICE_KEY is set).",
@@ -3415,8 +3452,11 @@ def _tax_1040_local_stub(file_name: str) -> dict:
     ]
     return {
         "ok": True,
-        "profile": "tax-1040-carryforward",
+        "profile": profile,
         "fields": fields,
+        # Per-field confidence (0..1) lets the confirm step flag what to double-check.
+        # The stub is certain of its fixture; a live extractor fills this in.
+        "confidence": {k: (1.0 if v is not None else 0.0) for k, v in fields.items()},
         "warnings": warnings,
         "providerMeta": {"provider": "stub", "model": "api-local-stub"},
         "evidence": {
@@ -3439,8 +3479,9 @@ async def extract_tax_1040_carryforward(
     from app.pdf_text_gate import gate_tax_1040_pdf_bytes
 
     email, _user, _plan = _require_paid_plan(request)
-    if profile and profile != "tax-1040-carryforward":
-        raise HTTPException(400, "Only profile tax-1040-carryforward is supported here.")
+    profile = profile or "tax-1040-carryforward"
+    if profile not in EXTRACT_PROFILES:
+        raise HTTPException(400, f"Unsupported profile; expected one of {', '.join(EXTRACT_PROFILES)}.")
 
     raw = await file.read()
     if not raw:
@@ -3486,12 +3527,12 @@ async def extract_tax_1040_carryforward(
             bool(TAX_1040_LIVE_EXTRACT_ENABLED),
             bool(EXTRACT_SERVICE_KEY),
         )
-        return _tax_1040_local_stub(fname)
+        return _tax_1040_local_stub(fname, profile)
 
     # Forward multipart to shared extract-document (service auth — no Evidence write).
     try:
         files = {"file": (fname, raw, ctype)}
-        data = {"profile": "tax-1040-carryforward"}
+        data = {"profile": profile}
         headers = {"x-extract-service-key": EXTRACT_SERVICE_KEY}
         if EXTRACT_ANON_KEY:
             headers["apikey"] = EXTRACT_ANON_KEY
