@@ -3612,3 +3612,73 @@ async def extract_tax_1040_carryforward(
         gate.get("alnum", 0),
     )
     return body
+
+
+# PHASE 2 (Prior-Year Review): the text route. The browser reads the PDF's text
+# layer with pdf.js, masks every SSN-like string on the device, and sends only
+# that masked text. The PDF itself is never transmitted, which is both the
+# usable path (every real Form 1040 carries an SSN on page 1, so a refuse-on-SSN
+# upload gate blocks the whole feature) and the stronger one. The server does not
+# trust the browser's masking: prepare_text() masks again and refuses if anything
+# survives, exactly as on the file route.
+TAX_1040_MAX_TEXT_CHARS = 200_000
+
+
+class ExtractText(BaseModel):
+    profile: str = "tax-1040-review"
+    text: str
+
+
+@app.post("/extract/tax-1040-text")
+@limiter.limit("10/minute")
+async def extract_tax_1040_text(r: ExtractText, request: Request):
+    """Review extract from a browser-masked text layer (HITL — confirm before use)."""
+    from app.ssn_redact import classify_text_layer, count_alphanumeric
+    from app.tax_extract import prepare_text, ExtractError
+
+    email, _user, _plan = _require_paid_plan(request)
+    profile = r.profile or "tax-1040-review"
+    if profile not in EXTRACT_PROFILES:
+        raise HTTPException(400, f"Unsupported profile; expected one of {', '.join(EXTRACT_PROFILES)}.")
+    text = r.text or ""
+    if not text.strip():
+        raise HTTPException(400, "Empty text.")
+    if len(text) > TAX_1040_MAX_TEXT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "FILE_TOO_LARGE", "message": "That return is too long to read. Enter the figures manually."},
+        )
+    if classify_text_layer(text) == "image-only":
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "IMAGE_ONLY_PDF", "message": "This looks like a scanned or image-only PDF. Upload a PDF with a selectable text layer, or enter the figures manually."},
+        )
+    try:
+        masked = prepare_text(text)   # second mask; refuses if any SSN survives
+    except ExtractError:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "SSN_DETECTED", "message": "A Social Security number could not be masked. Nothing was sent; enter the figures manually."},
+        )
+    alnum = count_alphanumeric(masked)
+
+    provider_ready = bool(OPENAI_API_KEY) if TAX_EXTRACT_PROVIDER == "openai" else False
+    if not provider_ready or not TAX_1040_LIVE_EXTRACT_ENABLED:
+        logger.info(
+            "extract tax-1040-text local stub for %s alnum=%s live=%s provider=%s ready=%s",
+            email, alnum, bool(TAX_1040_LIVE_EXTRACT_ENABLED), TAX_EXTRACT_PROVIDER, provider_ready,
+        )
+        return _tax_1040_local_stub("prior-year-1040.pdf", profile)
+
+    from app.tax_extract import extract_fields_from_text
+
+    try:
+        body = extract_fields_from_text(masked, profile, api_key=OPENAI_API_KEY, model=TAX_EXTRACT_MODEL)
+    except ExtractError as e:
+        logger.warning("extract tax-1040-text native failed for %s: %s", email, e)
+        raise HTTPException(503, "The return could not be read right now. Enter the figures manually or try again later.")
+    logger.info(
+        "extract tax-1040-text native ok for %s alnum=%s found=%s model=%s",
+        email, alnum, body["providerMeta"].get("fieldsFound"), TAX_EXTRACT_MODEL,
+    )
+    return body
