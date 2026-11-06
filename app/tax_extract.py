@@ -88,9 +88,73 @@ CARRYFORWARD_FIELDS: list[tuple[str, str, str]] = [
     ("priorYearAGI", "number", "Form 1040 line 11 adjusted gross income"),
 ]
 
+# ── Entity returns (PHASE 2b) ──────────────────────────────────────────────────
+# An S-Corp or partnership owner's strategy lives on the entity return, not the
+# 1040: officer pay vs. distributions, what the entity already deducts, and what
+# Form 4562 shows was placed in service. Same privacy contract; EINs are fine,
+# SSNs are masked by the same path, and no names are asked for.
+SCORP_FIELDS: list[tuple[str, str, str]] = [
+    ("taxYear", "integer", "the tax year printed at the top of Form 1120-S"),
+    ("shareholderCount", "integer", "Form 1120-S item I, number of shareholders (or the number of Schedules K-1 attached)"),
+    ("grossReceipts", "number", "Form 1120-S line 1a gross receipts or sales"),
+    ("totalIncome", "number", "Form 1120-S line 6 total income"),
+    ("officerCompensation", "number", "Form 1120-S line 7 compensation of officers (Form 1125-E total)"),
+    ("salariesWages", "number", "Form 1120-S line 8 salaries and wages, excluding officers"),
+    ("rentsPaid", "number", "Form 1120-S line 11 rents"),
+    ("taxesAndLicenses", "number", "Form 1120-S line 12 taxes and licenses"),
+    ("depreciation", "number", "Form 1120-S line 14 depreciation"),
+    ("sec179", "number", "Schedule K line 11 section 179 deduction (or Form 4562 line 12)"),
+    ("bonusDepreciation", "number", "Form 4562 line 14 special depreciation allowance; null if Form 4562 is not in the package"),
+    ("pensionProfitSharing", "number", "Form 1120-S line 17 pension, profit-sharing, etc., plans"),
+    ("employeeBenefits", "number", "Form 1120-S line 18 employee benefit programs"),
+    ("otherDeductions", "number", "Form 1120-S line 19 other deductions"),
+    ("totalDeductions", "number", "Form 1120-S line 20 total deductions"),
+    ("ordinaryBusinessIncome", "number", "Form 1120-S line 21 ordinary business income or loss (losses negative)"),
+    ("shareholderHealthIns", "number", "health insurance premiums paid for more-than-2% shareholders and included in officer wages, from a statement or Schedule K-1 box 17 code AD; null if not shown"),
+    ("distributions", "number", "Schedule K line 16d distributions (or Schedule M-2 distributions), total to all shareholders"),
+    ("loansToShareholders", "number", "Schedule L line 7 loans to shareholders, end of year"),
+    ("loansFromShareholders", "number", "Schedule L line 19 loans from shareholders, end of year"),
+    ("totalAssets", "number", "Schedule L line 15 total assets, end of year; null if Schedule L is not completed"),
+    ("vehicleOrTravel", "number", "the sum of any 'auto', 'vehicle', 'travel' or 'meals' lines on the other-deductions statement; null if no such statement"),
+    ("homeOfficeOrAccountablePlan", "boolean", "true if the other-deductions statement shows a line for office-in-home, accountable plan, or employee expense reimbursement"),
+]
+
+PARTNERSHIP_FIELDS: list[tuple[str, str, str]] = [
+    ("taxYear", "integer", "the tax year printed at the top of Form 1065"),
+    ("partnerCount", "integer", "Form 1065 item I, number of Schedules K-1 attached"),
+    ("grossReceipts", "number", "Form 1065 line 1a gross receipts or sales"),
+    ("totalIncome", "number", "Form 1065 line 8 total income"),
+    ("guaranteedPayments", "number", "Form 1065 line 10 guaranteed payments to partners"),
+    ("salariesWages", "number", "Form 1065 line 9 salaries and wages, other than to partners"),
+    ("rentsPaid", "number", "Form 1065 line 13 rent"),
+    ("taxesAndLicenses", "number", "Form 1065 line 14 taxes and licenses"),
+    ("depreciation", "number", "Form 1065 line 16c depreciation"),
+    ("sec179", "number", "Schedule K line 12 section 179 deduction (or Form 4562 line 12)"),
+    ("bonusDepreciation", "number", "Form 4562 line 14 special depreciation allowance; null if Form 4562 is not in the package"),
+    ("retirementPlans", "number", "Form 1065 line 18 retirement plans, etc."),
+    ("employeeBenefits", "number", "Form 1065 line 19 employee benefit programs"),
+    ("otherDeductions", "number", "Form 1065 line 20 other deductions"),
+    ("totalDeductions", "number", "Form 1065 line 21 total deductions"),
+    ("ordinaryBusinessIncome", "number", "Form 1065 line 22 ordinary business income or loss (losses negative)"),
+    ("netRentalRealEstate", "number", "Schedule K line 2 net rental real estate income or loss (Form 8825); null if none"),
+    ("selfEmploymentEarnings", "number", "Schedule K line 14a net earnings from self-employment"),
+    ("distributions", "number", "Schedule K line 19a distributions of cash and marketable securities"),
+    ("totalAssets", "number", "Schedule L line 14 total assets, end of year; null if Schedule L is not completed"),
+    ("vehicleOrTravel", "number", "the sum of any 'auto', 'vehicle', 'travel' or 'meals' lines on the other-deductions statement; null if no such statement"),
+]
+
 PROFILES: dict[str, list[tuple[str, str, str]]] = {
     "tax-1040-review": REVIEW_FIELDS,
     "tax-1040-carryforward": CARRYFORWARD_FIELDS,
+    "tax-1120s-review": SCORP_FIELDS,
+    "tax-1065-review": PARTNERSHIP_FIELDS,
+}
+
+_DOCUMENT_KIND = {
+    "tax-1040-review": "United States federal individual income tax return (Form 1040 package)",
+    "tax-1040-carryforward": "United States federal individual income tax return (Form 1040 package)",
+    "tax-1120s-review": "United States S corporation income tax return (Form 1120-S package with Schedules K, K-1, L, M-2 and Form 4562)",
+    "tax-1065-review": "United States partnership return of income (Form 1065 package with Schedules K, K-1, L and Form 4562)",
 }
 
 
@@ -123,9 +187,9 @@ def _json_schema(profile: str) -> dict[str, Any]:
 
 def _system_prompt(profile: str) -> str:
     lines = "\n".join(f"- {k} ({t}): {d}" for k, t, d in PROFILES[profile])
+    kind = _DOCUMENT_KIND.get(profile, "United States federal tax return")
     return (
-        "You read the text layer of a United States federal individual income tax return "
-        "(Form 1040 package) and return the figures asked for as JSON. Rules:\n"
+        f"You read the text layer of a {kind} and return the figures asked for as JSON. Rules:\n"
         "1. Use only what the document states. If a figure is not present, return null for it "
         "and a confidence of 0. Never estimate, derive, or carry a figure from one line to another "
         "unless the field definition says to sum or subtract.\n"

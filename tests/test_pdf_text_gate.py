@@ -236,7 +236,7 @@ def test_extract_rejects_oversize(client, main, monkeypatch):
 # ── PHASE 2 (Prior-Year Review): the wider tax-1040-review profile ────────────
 
 def test_review_profile_is_registered_and_keys_match_the_contract(main):
-    assert main.EXTRACT_PROFILES == ("tax-1040-carryforward", "tax-1040-review")
+    assert main.EXTRACT_PROFILES[:2] == ("tax-1040-carryforward", "tax-1040-review")
     assert len(main.TAX_1040_REVIEW_FIELD_KEYS) == len(set(main.TAX_1040_REVIEW_FIELD_KEYS))
     # the carryforward keys the wizard already reads must survive in the wider profile
     for k in ("priorPassiveLossCarryforward", "capLossCarryforwardST", "capLossCarryforwardLT", "nolCarryforward", "priorYearQBILoss"):
