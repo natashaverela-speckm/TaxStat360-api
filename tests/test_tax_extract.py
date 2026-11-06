@@ -60,6 +60,13 @@ def test_prompt_names_every_field_and_forbids_identifiers():
     assert "Never estimate" in p
 
 
+def test_filing_status_is_decided_by_a_mark_or_the_standard_deduction_not_the_label():
+    p = tx._system_prompt("tax-1040-review")
+    assert "do not pick a status just because its label appears" in p
+    assert "15,750 = single" in p and "23,625 = hoh" in p and "21,900 = hoh" in p
+    assert "[checked:" in p
+
+
 # ── privacy ──────────────────────────────────────────────────────────────────
 
 def test_prepare_text_masks_ssns_and_caps_length():
@@ -203,3 +210,18 @@ def test_endpoint_native_failure_is_a_503_not_a_leak(client, main, monkeypatch):
     r = client.post("/extract/tax-1040-carryforward", files={"file": ("return.pdf", _text_pdf_bytes(), "application/pdf")}, data={"profile": "tax-1040-review"})
     assert r.status_code == 503
     assert "secret upstream detail" not in r.text
+
+
+def test_parentheses_and_trailing_minus_are_losses():
+    assert tx._parse_amount("(12,345)") == -12345.0
+    assert tx._parse_amount("-12,345") == -12345.0
+    assert tx._parse_amount("12,345-") == -12345.0
+    assert tx._parse_amount("$12,345") == 12345.0
+    assert tx._parse_amount(-5) == -5.0
+    answer = {k: None for k in tx.field_keys("tax-1040-review")}
+    answer.update({"k1ScorpOrdinary": "(48,210)", "schedCNet": "(1,000)"})
+    r = tx.extract_fields_from_text(SAMPLE_TEXT, "tax-1040-review", api_key="k", model="m",
+                                    post=lambda *a, **k: _Resp(content=_model_answer(answer)))
+    assert r["fields"]["k1ScorpOrdinary"] == -48210.0
+    assert r["fields"]["schedCNet"] == -1000.0
+    assert "parentheses" in tx._system_prompt("tax-1040-review")
