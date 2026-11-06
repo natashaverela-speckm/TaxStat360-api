@@ -3413,7 +3413,7 @@ _TAX_FIXTURE_FIELDS = {
 # whole 1040 package for the review memo. The key list is the contract shared with
 # the frontend (src/lib/priorYearReview.js TAX_1040_REVIEW_FIELDS) and the extract
 # service; change it in all three places together. Same gates, same retention rule.
-EXTRACT_PROFILES = ("tax-1040-carryforward", "tax-1040-review")
+EXTRACT_PROFILES = ("tax-1040-carryforward", "tax-1040-review", "tax-1120s-review", "tax-1065-review", "tax-1120-review")
 TAX_1040_REVIEW_FIELD_KEYS = [
     "taxYear", "filingStatus", "dependents",
     "w2Wages", "w2Withheld", "officerW2",
@@ -3442,12 +3442,51 @@ _TAX_REVIEW_FIXTURE_FIELDS = {
 }
 _TAX_REVIEW_STUB_FIELDS = {k: None for k in TAX_1040_REVIEW_FIELD_KEYS}
 
+# PHASE 2b: entity returns. Key lists live in app/tax_extract.py (SCORP_FIELDS,
+# PARTNERSHIP_FIELDS) and mirror src/lib/priorYearReview.js on the frontend.
+# The 1120-S fixture is the same walkthrough S-Corp as the 1040 fixture above
+# (K-1 box 1 = 113,880; officer W-2 = 80,000) so the two stubs agree.
+_TAX_1120S_FIXTURE_FIELDS = {
+    "taxYear": 2025, "shareholderCount": 1,
+    "grossReceipts": 420000, "totalIncome": 420000,
+    "officerCompensation": 80000, "salariesWages": 96000, "rentsPaid": 24000, "taxesAndLicenses": 13460,
+    "depreciation": 6200, "sec179": None, "bonusDepreciation": None,
+    "pensionProfitSharing": None, "employeeBenefits": None, "otherDeductions": 86460, "totalDeductions": 306120,
+    "ordinaryBusinessIncome": 113880, "shareholderHealthIns": None,
+    "distributions": 95000, "loansToShareholders": None, "loansFromShareholders": None, "totalAssets": 148000,
+    "vehicleOrTravel": 9800, "homeOfficeOrAccountablePlan": False,
+}
+_TAX_1120_FIXTURE_FIELDS = {
+    "taxYear": 2025,
+    "grossReceipts": 650000, "totalIncome": 650000,
+    "officerCompensation": 150000, "salariesWages": 180000, "rentsPaid": 36000, "taxesAndLicenses": 27000,
+    "charitableContributions": None, "depreciation": 12000, "sec179": None, "bonusDepreciation": None,
+    "pensionProfitSharing": None, "employeeBenefits": None, "otherDeductions": 125000, "totalDeductions": 530000,
+    "taxableIncome": 120000, "totalTax": 25200, "dividendsPaid": 60000,
+    "loansToShareholders": None, "loansFromShareholders": None, "retainedEarnings": 310000, "totalAssets": 480000,
+    "vehicleOrTravel": 14000, "homeOfficeOrAccountablePlan": False,
+}
+_TAX_1065_FIXTURE_FIELDS = {
+    "taxYear": 2025, "partnerCount": 2,
+    "grossReceipts": 310000, "totalIncome": 310000,
+    "guaranteedPayments": 60000, "salariesWages": 40000, "rentsPaid": 18000, "taxesAndLicenses": 4100,
+    "depreciation": 5400, "sec179": None, "bonusDepreciation": None,
+    "retirementPlans": None, "employeeBenefits": None, "otherDeductions": 52500, "totalDeductions": 180000,
+    "ordinaryBusinessIncome": 130000, "netRentalRealEstate": None, "selfEmploymentEarnings": 190000,
+    "distributions": 110000, "totalAssets": 92000, "vehicleOrTravel": 7200,
+}
+
 
 def _tax_1040_local_stub(file_name: str, profile: str = "tax-1040-carryforward") -> dict:
     """Dev fallback when EXTRACT_SERVICE_KEY is not configured."""
     name = (file_name or "").lower()
     if profile == "tax-1040-review":
         fields = dict(_TAX_REVIEW_FIXTURE_FIELDS) if _TAX_FIXTURE_TOKEN in name else dict(_TAX_REVIEW_STUB_FIELDS)
+    elif profile in ("tax-1120s-review", "tax-1065-review", "tax-1120-review"):
+        from app.tax_extract import field_keys
+
+        fixture = {"tax-1120s-review": _TAX_1120S_FIXTURE_FIELDS, "tax-1065-review": _TAX_1065_FIXTURE_FIELDS, "tax-1120-review": _TAX_1120_FIXTURE_FIELDS}[profile]
+        fields = dict(fixture) if ("fixture-tax-" in name and "smoke" in name) else {k: None for k in field_keys(profile)}
     else:
         fields = (
             dict(_TAX_FIXTURE_FIELDS)
@@ -3627,6 +3666,7 @@ TAX_1040_MAX_TEXT_CHARS = 200_000
 class ExtractText(BaseModel):
     profile: str = "tax-1040-review"
     text: str
+    fixture: str | None = None   # dev only: a filename-like hint for the local stub
 
 
 @app.post("/extract/tax-1040-text")
@@ -3668,7 +3708,9 @@ async def extract_tax_1040_text(r: ExtractText, request: Request):
             "extract tax-1040-text local stub for %s alnum=%s live=%s provider=%s ready=%s",
             email, alnum, bool(TAX_1040_LIVE_EXTRACT_ENABLED), TAX_EXTRACT_PROVIDER, provider_ready,
         )
-        return _tax_1040_local_stub("prior-year-1040.pdf", profile)
+        # The text route has no filename; let the frontend's fixture flag through so
+        # the stub can return the walkthrough figures in local dev.
+        return _tax_1040_local_stub(r.fixture or "prior-year.pdf", profile)
 
     from app.tax_extract import extract_fields_from_text
 

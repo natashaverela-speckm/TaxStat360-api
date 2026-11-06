@@ -9,6 +9,13 @@ import pytest
 
 from tests.test_pdf_text_gate import _session_pro
 
+
+@pytest.fixture(autouse=True)
+def _fresh_rate_limit(main):
+    main.limiter.reset()
+    yield
+    main.limiter.reset()
+
 CLEAN = "SYNTHETIC Form 1040 2025 Wages 180000 Federal income tax withheld 20000 Adjusted gross income 262000 Total tax 43199"
 MASKED = "Your social security number XXX-XX-XXXX Spouse XXX-XX-XXXX " + CLEAN
 
@@ -61,3 +68,44 @@ def test_image_only_empty_and_oversize_are_refused(client, main):
     assert r.status_code == 400 and r.json()["detail"]["code"] == "FILE_TOO_LARGE"
     r = client.post("/extract/tax-1040-text", json={"profile": "bogus", "text": CLEAN})
     assert r.status_code == 400
+
+
+# ── PHASE 2b: entity returns ──────────────────────────────────────────────────
+
+def test_entity_profiles_are_registered_and_schema_strict(main):
+    import app.tax_extract as tx
+
+    for profile in ("tax-1120s-review", "tax-1065-review", "tax-1120-review"):
+        assert profile in main.EXTRACT_PROFILES
+        keys = tx.field_keys(profile)
+        assert len(keys) == len(set(keys))
+        s = tx._json_schema(profile)
+        assert set(s["schema"]["properties"]["fields"]["required"]) == set(keys)
+        prompt = tx._system_prompt(profile)
+        for k in keys:
+            assert k in prompt
+    assert "1120-S" in tx._system_prompt("tax-1120s-review")
+    assert "1065" in tx._system_prompt("tax-1065-review")
+    assert "officerCompensation" in tx.field_keys("tax-1120s-review")
+    assert "guaranteedPayments" in tx.field_keys("tax-1065-review")
+    assert "dividendsPaid" in tx.field_keys("tax-1120-review") and "retainedEarnings" in tx.field_keys("tax-1120-review")
+    assert "corporation income tax return" in tx._system_prompt("tax-1120-review")
+
+
+@pytest.mark.parametrize("profile,fixture_key", [("tax-1120s-review", "officerCompensation"), ("tax-1065-review", "guaranteedPayments"), ("tax-1120-review", "dividendsPaid")])
+def test_entity_stub_returns_fixture_when_hinted_else_nulls(client, main, monkeypatch, profile, fixture_key):
+    monkeypatch.setattr(main, "TAX_1040_LIVE_EXTRACT_ENABLED", False)
+    _session_pro(client, main)
+    r = client.post("/extract/tax-1040-text", json={"profile": profile, "text": MASKED, "fixture": "fixture-tax-1120s-smoke.pdf"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["profile"] == profile and body["fields"][fixture_key] not in (None, 0)
+    assert body["evidence"]["retained"] is False
+    r = client.post("/extract/tax-1040-text", json={"profile": profile, "text": MASKED})
+    assert r.status_code == 200, r.text
+    assert r.json()["fields"][fixture_key] is None
+
+
+def test_scorp_fixture_agrees_with_the_1040_fixture(main):
+    assert main._TAX_1120S_FIXTURE_FIELDS["ordinaryBusinessIncome"] == main._TAX_REVIEW_FIXTURE_FIELDS["k1ScorpOrdinary"]
+    assert main._TAX_1120S_FIXTURE_FIELDS["officerCompensation"] == main._TAX_REVIEW_FIXTURE_FIELDS["officerW2"]
