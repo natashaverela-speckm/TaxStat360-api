@@ -1118,7 +1118,7 @@ def mc_subscribe(email, name=""):
 # with it (see below) since neither had any caller.
 #
 # PHASE 1b (single plan, Nov 2026). TaxStat360 is pre-launch with no subscribers, so
-# there is ONE plan, "pro" (sold as Toolkit Pro from the Tax Strategies Toolkit side).
+# there is ONE plan, "pro". TaxStat360 is a standalone product.
 # "starter" is not a product: it is the name of the NO-SUBSCRIPTION state — what a new
 # registration starts as and what a cancelled / lapsed subscription falls back to (see
 # the Stripe webhook). Every feature gate asks "is this account on a paid plan", never
@@ -1432,7 +1432,7 @@ PLAN_PRICES = {
     "pro": {
         "monthly": int(os.environ.get("PRO_PRICE_MONTHLY", "39") or 39),
         "annual_total": int(os.environ.get("PRO_PRICE_ANNUAL", "399") or 399),
-        "label": os.environ.get("PRO_PLAN_LABEL", "Toolkit Pro") or "Toolkit Pro",
+        "label": os.environ.get("PRO_PLAN_LABEL", "TaxStat360") or "TaxStat360",
     },
 }
 
