@@ -231,3 +231,36 @@ def test_extract_rejects_oversize(client, main, monkeypatch):
     )
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "FILE_TOO_LARGE"
+
+
+# ── PHASE 2 (Prior-Year Review): the wider tax-1040-review profile ────────────
+
+def test_review_profile_is_registered_and_keys_match_the_contract(main):
+    assert main.EXTRACT_PROFILES == ("tax-1040-carryforward", "tax-1040-review")
+    assert len(main.TAX_1040_REVIEW_FIELD_KEYS) == len(set(main.TAX_1040_REVIEW_FIELD_KEYS))
+    # the carryforward keys the wizard already reads must survive in the wider profile
+    for k in ("priorPassiveLossCarryforward", "capLossCarryforwardST", "capLossCarryforwardLT", "nolCarryforward", "priorYearQBILoss"):
+        assert k in main.TAX_1040_REVIEW_FIELD_KEYS
+    assert set(main._TAX_REVIEW_FIXTURE_FIELDS) == set(main.TAX_1040_REVIEW_FIELD_KEYS)
+
+
+def test_review_stub_returns_the_fixture_with_confidence(main):
+    body = main._tax_1040_local_stub("fixture-tax-1040-smoke.pdf", "tax-1040-review")
+    assert body["profile"] == "tax-1040-review"
+    assert body["fields"]["k1ScorpOrdinary"] == 113880
+    assert body["confidence"]["k1ScorpOrdinary"] == 1.0
+    assert body["confidence"]["schedCNet"] == 0.0
+    assert body["evidence"]["deletedAfterProcessing"] is True
+    blank = main._tax_1040_local_stub("anything.pdf", "tax-1040-review")
+    assert all(v is None for v in blank["fields"].values())
+
+
+def test_unknown_profile_is_refused(client, main):
+    _session_pro(client, main, "prof@example.com")
+    r = client.post(
+        "/extract/tax-1040-carryforward",
+        files={"file": ("x.pdf", b"%PDF-1.4 text text text text text text text text text", "application/pdf")},
+        data={"profile": "tax-1040-everything"},
+    )
+    assert r.status_code == 400
+    assert "Unsupported profile" in (r.json().get("detail") or "")
