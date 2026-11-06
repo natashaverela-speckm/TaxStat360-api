@@ -51,8 +51,8 @@ REVIEW_FIELDS: list[tuple[str, str, str]] = [
     ("officerW2", "number", "wages on a W-2 whose employer is the taxpayer's own S corporation (an S corporation whose K-1 is in the package); null if no S-Corp K-1 is present"),
     ("schedCGross", "number", "Schedule C line 1 gross receipts (sum if several Schedules C)"),
     ("schedCNet", "number", "Schedule C line 31 net profit or loss (sum if several; losses negative)"),
-    ("k1ScorpOrdinary", "number", "Schedule K-1 (Form 1120-S) box 1 ordinary business income, summed across S-Corp K-1s"),
-    ("k1PartnershipOrdinary", "number", "Schedule K-1 (Form 1065) box 1 ordinary business income, summed across partnership K-1s"),
+    ("k1ScorpOrdinary", "number", "Schedule K-1 (Form 1120-S) box 1 ordinary business income (loss), summed across S-Corp K-1s; a loss, usually printed in parentheses, is negative"),
+    ("k1PartnershipOrdinary", "number", "Schedule K-1 (Form 1065) box 1 ordinary business income (loss), summed across partnership K-1s; a loss, usually printed in parentheses, is negative"),
     ("schedEPropertyCount", "integer", "number of rental properties listed on Schedule E Part I"),
     ("schedERent", "number", "Schedule E line 3 rents received, all properties"),
     ("schedEExpenses", "number", "Schedule E total expenses (line 20) MINUS depreciation (line 18), all properties"),
@@ -222,7 +222,10 @@ def _system_prompt(profile: str) -> str:
         "1. Use only what the document states. If a figure is not present, return null for it "
         "and a confidence of 0. Never estimate, derive, or carry a figure from one line to another "
         "unless the field definition says to sum or subtract.\n"
-        "2. Amounts are plain numbers in dollars (no commas, no $). Losses and negative lines are negative.\n"
+        "2. Amounts are plain numbers in dollars (no commas, no $). Losses and negative lines are negative: "
+        "an amount printed in parentheses such as (12,345), with a leading minus, or on a line whose label says "
+        "'loss' when the loss column is filled, is returned as a negative number. Schedule K-1 box 1 and "
+        "Schedule C line 31 are the usual cases.\n"
         "3. confidence is 0 to 1 per field: 1 when the line is unambiguous, lower when the text layer "
         "is garbled, the line is inferred from context, or several candidates exist.\n"
         "4. Return nothing but the JSON object. Do not include names, addresses, or identification numbers.\n"
@@ -246,6 +249,22 @@ def prepare_text(text: str) -> str:
     return masked
 
 
+def _parse_amount(v: Any) -> float:
+    """'12,345' → 12345.0; '(12,345)' and '-12,345' and '12,345-' → -12345.0; '$' ignored."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    t = str(v).strip().replace(",", "").replace("$", "").replace(" ", "")
+    neg = False
+    if t.startswith("(") and t.endswith(")"):
+        neg, t = True, t[1:-1]
+    if t.endswith("-"):
+        neg, t = True, t[:-1]
+    if t.startswith("-"):
+        neg, t = (not neg) if neg else True, t[1:]
+    n = float(t)
+    return -n if neg else n
+
+
 def _coerce(profile: str, fields: dict[str, Any], confidence: dict[str, Any]) -> tuple[dict, dict]:
     out_f: dict[str, Any] = {}
     out_c: dict[str, float] = {}
@@ -255,7 +274,7 @@ def _coerce(profile: str, fields: dict[str, Any], confidence: dict[str, Any]) ->
             if v is None or v == "":
                 out_f[key] = None
             elif typ == "number":
-                out_f[key] = float(str(v).replace(",", "").replace("$", ""))
+                out_f[key] = _parse_amount(v)
             elif typ == "integer":
                 out_f[key] = int(float(str(v)))
             elif typ == "boolean":
