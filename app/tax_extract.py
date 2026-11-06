@@ -36,7 +36,7 @@ OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 # Keep the prompt within a sane budget: a 1040 package's text layer is usually
 # 20–60k characters; anything past this is almost always state forms and
 # worksheets that carry nothing the review needs.
-MAX_TEXT_CHARS = 120_000
+MAX_TEXT_CHARS = 280_000
 
 # ── Field contracts ────────────────────────────────────────────────────────────
 # Mirrors main.py TAX_1040_REVIEW_FIELD_KEYS / frontend TAX_1040_REVIEW_FIELDS.

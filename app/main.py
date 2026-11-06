@@ -3678,7 +3678,7 @@ async def extract_tax_1040_carryforward(
 # upload gate blocks the whole feature) and the stronger one. The server does not
 # trust the browser's masking: prepare_text() masks again and refuses if anything
 # survives, exactly as on the file route.
-TAX_1040_MAX_TEXT_CHARS = 200_000
+TAX_1040_MAX_TEXT_CHARS = 400_000
 
 
 class ExtractText(BaseModel):
