@@ -32,7 +32,7 @@ def _session_pro(client, main, email="pro-extract@example.com"):
             "name": "Extract Pro",
             "pw": main._hash_password("TestPassword12!"),
             "tok": "tok_" + email,
-            "plan": "professional",
+            "plan": "pro",
             "verified": True,
         },
     )
@@ -168,7 +168,7 @@ def test_extract_route_ssn_400(client, main, monkeypatch):
     assert "219" not in detail["message"]
 
 
-def test_extract_route_requires_professional(client, main, monkeypatch):
+def test_extract_route_requires_paid_plan(client, main, monkeypatch):
     monkeypatch.setattr(main, "EXTRACT_SERVICE_KEY", "")
     main.ddb_put_user(
         "starter@example.com",

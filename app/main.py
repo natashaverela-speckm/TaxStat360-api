@@ -1117,18 +1117,15 @@ def mc_subscribe(email, name=""):
 # not a feature worth preserving. /user/me and /user/business-info are removed
 # with it (see below) since neither had any caller.
 #
-# PLAN_ORDER is still used by _require_minimum_plan() below and stays.
-PLAN_ORDER = ["starter", "professional", "enterprise", "pro"]
-
-# PHASE 1b (single plan, Nov 2026). TaxStat360 ships as ONE plan, "pro" (sold as
-# Toolkit Pro from the Tax Strategies Toolkit side). The three legacy tiers stay
-# defined so (a) existing Stripe subscriptions keep mapping back to a plan in the
-# webhook and (b) nothing deployed breaks before the new Stripe prices exist.
-# "starter" remains what a cancelled / lapsed subscription falls back to (see the
-# webhook), so it is treated as NO paid plan: every feature gate below asks for a
-# paid plan, not a tier. A legacy Professional or Enterprise account therefore has
-# everything a Pro account has, and the Enterprise-only report gates are gone.
-FULL_ACCESS_PLANS = frozenset({"pro", "professional", "enterprise"})
+# PHASE 1b (single plan, Nov 2026). TaxStat360 is pre-launch with no subscribers, so
+# there is ONE plan, "pro" (sold as Toolkit Pro from the Tax Strategies Toolkit side).
+# "starter" is not a product: it is the name of the NO-SUBSCRIPTION state — what a new
+# registration starts as and what a cancelled / lapsed subscription falls back to (see
+# the Stripe webhook). Every feature gate asks "is this account on a paid plan", never
+# for a tier. The old Starter / Professional / Enterprise tiers and their Stripe prices
+# are gone; delete those six prices in Stripe.
+PLAN_ORDER = ["starter", "pro"]
+FULL_ACCESS_PLANS = frozenset({"pro"})
 
 
 # INPUT-HYGIENE FIX (fresh-pass audit, Aug 2026): email fields across the API were
@@ -1185,31 +1182,23 @@ class Sub(BaseModel):
     billing: str = "monthly"
 
 
-# Legacy tiers: archive these prices in Stripe (do not delete) once Pro is live, so
-# the webhook can still resolve an existing subscriber's plan from the price id.
-LEGACY_PRICE_IDS = {
-    "starter": {"monthly": "price_1TJmmDGUoj1XrJQjbArxsVDy", "annual": "price_1TO5zWGUoj1XrJQjcWpQmMnC"},
-    "professional": {"monthly": "price_1TJmmwGUoj1XrJQjZp897iCJ", "annual": "price_1TO60pGUoj1XrJQjhU4R9yGQ"},
-    "enterprise": {"monthly": "price_1TJmnKGUoj1XrJQjfgrOhAlC", "annual": "price_1TO62FGUoj1XrJQjtcbNym1Z"},
-}
-
 # PHASE 1b: the one live plan. Price ids come from the environment so the Stripe
-# products can be created (and rotated) without a deploy. Until BOTH are set, "pro"
-# is not purchasable through /stripe/subscribe (it falls back to "starter" exactly
-# as an unknown plan id always has) and the webhook cannot map to it — set
-# STRIPE_PRICE_PRO_MONTHLY and STRIPE_PRICE_PRO_ANNUAL on the box before launch.
+# product can be created (and rotated) without a deploy. Until BOTH are set, nothing
+# is purchasable: /stripe/subscribe answers 503 "plan not available" instead of
+# charging against a blank id, and the webhook cannot map a subscription to a plan.
+# Set STRIPE_PRICE_PRO_MONTHLY and STRIPE_PRICE_PRO_ANNUAL on the box before launch.
 STRIPE_PRICE_PRO_MONTHLY = os.environ.get("STRIPE_PRICE_PRO_MONTHLY", "").strip()
 STRIPE_PRICE_PRO_ANNUAL = os.environ.get("STRIPE_PRICE_PRO_ANNUAL", "").strip()
 PRO_PRICE_CONFIGURED = bool(STRIPE_PRICE_PRO_MONTHLY and STRIPE_PRICE_PRO_ANNUAL)
 
-PRICE_IDS = dict(LEGACY_PRICE_IDS)
-if PRO_PRICE_CONFIGURED:
-    PRICE_IDS["pro"] = {"monthly": STRIPE_PRICE_PRO_MONTHLY, "annual": STRIPE_PRICE_PRO_ANNUAL}
+PRICE_IDS = (
+    {"pro": {"monthly": STRIPE_PRICE_PRO_MONTHLY, "annual": STRIPE_PRICE_PRO_ANNUAL}}
+    if PRO_PRICE_CONFIGURED
+    else {}
+)
 
-# A plan id a client may send. "pro" is always a valid plan NAME (an account can be
-# put on it by the webhook or by hand); whether it can be BOUGHT here depends on the
-# price ids above.
-VALID_PLANS = set(LEGACY_PRICE_IDS.keys()) | {"pro"}
+# Plan names a client may send: "pro" to buy, "starter" meaning "no plan yet".
+VALID_PLANS = {"starter", "pro"}
 ALLOWED_PROVIDERS = {"quickbooks", "freshbooks", "xero", "wave"}
 
 # --- Integration credentials (audit P0-#1) ------------------------------------
@@ -1435,15 +1424,11 @@ def _send_verification_email(email, verify_tok):
 
 TRIAL_DAYS = 7
 
-# Must stay in lockstep with frontend src/constants.js (PLAN_PRICING).
-# annual_total = monthly * 10  ("two months free").
+# Must stay in lockstep with the frontend's plan copy (src/lib/constants.js).
+# PHASE 1b: one plan. Amounts are what the trial-confirmation email states, so they
+# MUST match the Stripe prices named by STRIPE_PRICE_PRO_*; overridable without a
+# deploy for the same reason the price ids are.
 PLAN_PRICES = {
-    "starter":      {"monthly": 79,  "annual_total": 790,  "label": "Starter"},
-    "professional": {"monthly": 149, "annual_total": 1490, "label": "Professional"},
-    "enterprise":   {"monthly": 299, "annual_total": 2990, "label": "Enterprise"},
-    # PHASE 1b: the one live plan. Amounts are what the trial-confirmation email
-    # states, so they MUST match the Stripe prices named by STRIPE_PRICE_PRO_*.
-    # Overridable without a deploy for the same reason the price ids are.
     "pro": {
         "monthly": int(os.environ.get("PRO_PRICE_MONTHLY", "39") or 39),
         "annual_total": int(os.environ.get("PRO_PRICE_ANNUAL", "399") or 399),
@@ -1453,7 +1438,7 @@ PLAN_PRICES = {
 
 
 def _send_trial_confirmation_email(email, name, plan, billing):
-    p = PLAN_PRICES.get(plan, PLAN_PRICES["starter"])
+    p = PLAN_PRICES.get(plan, PLAN_PRICES["pro"])
     is_annual = (billing or "monthly").lower() == "annual"
     amount = "$" + format(p["annual_total"] if is_annual else p["monthly"], ",")
     cadence = "every 12 months" if is_annual else "every month"
@@ -2061,7 +2046,11 @@ def subscribe(r: Sub, request: Request):
         if not x:
             raise HTTPException(404, "User not found")
         billing = r.billing if r.billing in ["monthly", "annual"] else "monthly"
-        plan = r.plan if r.plan in PRICE_IDS else "starter"
+        plan = r.plan if r.plan in PRICE_IDS else None
+        if plan is None:
+            # PHASE 1b: there is no fallback price to charge. Either the client sent a
+            # retired plan id or STRIPE_PRICE_PRO_* is not configured on this box.
+            raise HTTPException(503, "This plan is not available for purchase right now")
         price_id = PRICE_IDS[plan][billing]
         cid = x.get("stripe_customer_id", "")
         if not cid:
@@ -3072,9 +3061,8 @@ def integration_data(request: Request, p: str, year: str = ""):
 def _require_paid_plan(request: Request):
     """PHASE 1b: session + ANY paid plan (DynamoDB plan is source of truth).
 
-    Replaces the tiered floors on Aria, the return-extract endpoint and the two
-    report gates. "starter" is the lapsed/cancelled fallback, so it is refused;
-    pro / professional / enterprise all pass.
+    The only plan gate. "starter" means no subscription (new, lapsed or cancelled)
+    and is refused; "pro" passes.
     """
     email = _require_session_user(request)
     user = ddb_get_user(email) or {}
@@ -3084,19 +3072,6 @@ def _require_paid_plan(request: Request):
     return email, user, plan
 
 
-def _require_minimum_plan(request: Request, minimum: str):
-    """Session-required plan floor (DynamoDB plan is source of truth)."""
-    email = _require_session_user(request)
-    user = ddb_get_user(email) or {}
-    plan = user.get("plan", "starter")
-    try:
-        if PLAN_ORDER.index(plan) < PLAN_ORDER.index(minimum):
-            raise HTTPException(
-                403, f"{minimum.capitalize()} plan required"
-            )
-    except ValueError:
-        raise HTTPException(403, f"{minimum.capitalize()} plan required")
-    return email, user, plan
 
 
 @app.post("/aria")

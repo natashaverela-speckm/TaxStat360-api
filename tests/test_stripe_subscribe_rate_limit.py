@@ -59,7 +59,7 @@ def test_subscribe_rate_limit_is_10_per_minute(client, main, monkeypatch):
 
     body = {
         "email": email,
-        "plan": "professional",
+        "plan": "pro",
         "payment_method_id": "pm_card_visa",
         "billing": "monthly",
     }
@@ -93,7 +93,7 @@ def test_subscribe_uses_o1_lookup_not_full_table_scan(client, main, monkeypatch)
 
     resp = client.post("/stripe/subscribe", json={
         "email": email,
-        "plan": "professional",
+        "plan": "pro",
         "payment_method_id": "pm_card_visa",
         "billing": "monthly",
     })

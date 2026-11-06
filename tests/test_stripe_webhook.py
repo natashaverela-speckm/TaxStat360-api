@@ -39,7 +39,7 @@ def _webhook_event(etype, customer, **obj_extra):
 def test_subscription_updated_sets_plan_via_gsi(client, main, monkeypatch):
     monkeypatch.setattr(main, "WEBHOOK_SECRET", "")
     _mk_user(main, "sub@example.com", stripe_customer_id="cus_webhook_1", plan="starter")
-    pro_monthly = main.PRICE_IDS["professional"]["monthly"]
+    pro_monthly = main.PRICE_IDS["pro"]["monthly"]
     event = _webhook_event(
         "customer.subscription.updated",
         "cus_webhook_1",
@@ -53,7 +53,7 @@ def test_subscription_updated_sets_plan_via_gsi(client, main, monkeypatch):
     )
     assert r.status_code == 200
     assert r.json() == {"status": "ok"}
-    assert main.ddb_get_user("sub@example.com")["plan"] == "professional"
+    assert main.ddb_get_user("sub@example.com")["plan"] == "pro"
 
 
 def test_subscription_deleted_downgrades_to_starter(client, main, monkeypatch):
@@ -62,7 +62,7 @@ def test_subscription_deleted_downgrades_to_starter(client, main, monkeypatch):
         main,
         "gone@example.com",
         stripe_customer_id="cus_webhook_2",
-        plan="enterprise",
+        plan="pro",
     )
     event = _webhook_event("customer.subscription.deleted", "cus_webhook_2")
     r = client.post("/stripe/webhook", content=json.dumps(event))
@@ -83,7 +83,7 @@ def test_webhook_with_secret_processes_payload_not_stripe_object(client, main, m
     monkeypatch.setattr(
         main.stripe.Webhook, "construct_event", lambda *a, **k: _GetHostile()
     )
-    _mk_user(main, "sec@example.com", stripe_customer_id="cus_sec", plan="enterprise")
+    _mk_user(main, "sec@example.com", stripe_customer_id="cus_sec", plan="pro")
     event = _webhook_event("customer.subscription.deleted", "cus_sec")
     r = client.post(
         "/stripe/webhook",
@@ -153,10 +153,10 @@ def test_plan_update_uses_gsi_not_full_scan(client, main, monkeypatch):
     _mk_user(main, "gsi@example.com", stripe_customer_id="cus_gsi", plan="starter")
 
     with patch.object(main, "ddb_all_users") as scan:
-        main._ddb_update_user_plan("cus_gsi", "professional")
+        main._ddb_update_user_plan("cus_gsi", "pro")
         scan.assert_not_called()
 
-    assert main.ddb_get_user("gsi@example.com")["plan"] == "professional"
+    assert main.ddb_get_user("gsi@example.com")["plan"] == "pro"
 
 
 def test_invoice_payment_failed_returns_200(client, main, monkeypatch):

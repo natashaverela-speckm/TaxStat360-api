@@ -1,8 +1,8 @@
 """Report gates (CPA Briefing + Position Documentation).
 
 PHASE 1b (single plan, Nov 2026): these were Enterprise-only. TaxStat360 now has
-one plan, so the gate is "any paid plan": pro / professional / enterprise pass,
-starter (the lapsed-subscription fallback) and no session are refused.
+one plan, "pro": it passes; "starter" (no subscription) and no session are refused.
+Retired tier names are just unknown plans and are refused too.
 """
 
 
@@ -32,26 +32,18 @@ def test_cpa_briefing_authorize_blocks_starter(client, main):
     assert "plan" in (r.json().get("detail") or "").lower()
 
 
-def test_cpa_briefing_authorize_allows_professional_now(client, main):
-    _session_user(client, main, "pro@example.com", plan="professional")
-    r = client.post("/reports/cpa-briefing/authorize")
-    assert r.status_code == 200
-    assert r.json()["plan"] == "professional"
-
-
-def test_cpa_briefing_authorize_allows_enterprise(client, main):
-    _session_user(client, main, "ent@example.com", plan="enterprise")
-    r = client.post("/reports/cpa-briefing/authorize")
-    assert r.status_code == 200
-    assert r.json()["ok"] is True
-    assert r.json()["feature"] == "cpa-briefing"
-    assert r.json()["plan"] == "enterprise"
+def test_cpa_briefing_authorize_refuses_retired_tiers(client, main):
+    for tier in ("professional", "enterprise"):
+        _session_user(client, main, f"{tier}@example.com", plan=tier)
+        assert client.post("/reports/cpa-briefing/authorize").status_code == 403
 
 
 def test_cpa_briefing_authorize_allows_pro(client, main):
     _session_user(client, main, "pro1@example.com", plan="pro")
     r = client.post("/reports/cpa-briefing/authorize")
     assert r.status_code == 200
+    assert r.json()["ok"] is True
+    assert r.json()["feature"] == "cpa-briefing"
     assert r.json()["plan"] == "pro"
 
 

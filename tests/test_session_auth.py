@@ -7,7 +7,7 @@ def test_login_returns_access_token_and_auth_me_accepts_bearer(client, main):
         "name": "Session Test",
         "pw": main._hash_password("TestPassword12!"),
         "tok": "legacy",
-        "plan": "enterprise",
+        "plan": "pro",
         "verified": True,
     })
 
@@ -18,7 +18,7 @@ def test_login_returns_access_token_and_auth_me_accepts_bearer(client, main):
     assert r.status_code == 200
     data = r.json()
     assert data.get("access_token")
-    assert data.get("plan") == "enterprise"
+    assert data.get("plan") == "pro"
 
     # Bearer fallback when cookie is not sent (cross-origin SPA case).
     client.cookies.clear()
@@ -27,7 +27,7 @@ def test_login_returns_access_token_and_auth_me_accepts_bearer(client, main):
         headers={"Authorization": f"Bearer {data['access_token']}"},
     )
     assert me.status_code == 200
-    assert me.json()["plan"] == "enterprise"
+    assert me.json()["plan"] == "pro"
     assert me.json()["email"] == email
 
 
