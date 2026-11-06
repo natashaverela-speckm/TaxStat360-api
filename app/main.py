@@ -3454,7 +3454,7 @@ _TAX_REVIEW_FIXTURE_FIELDS = {
     "rentalBuildingBasis": 400000, "shortTermRental": False,
     "depreciationTotal": 28000, "sec179": None, "qbiDeduction": 18500, "selfEmpRetirement": None,
     "hsaDeduction": None, "selfEmpHealthIns": None, "homeOfficeClaimed": False,
-    "agi": 262000, "totalTax": 43199, "estimatedPaymentsMade": 12000, "underpaymentPenalty": 612,
+    "agi": 293880, "totalTax": 38799, "estimatedPaymentsMade": 12000, "underpaymentPenalty": 612,
     "priorPassiveLossCarryforward": 9000, "capLossCarryforwardST": None, "capLossCarryforwardLT": None,
     "nolCarryforward": None, "priorYearQBILoss": None,
 }
