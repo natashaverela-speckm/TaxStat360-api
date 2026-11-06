@@ -3490,7 +3490,8 @@ _PNL_FIXTURE_FIELDS = {
     "periodLabel": "January 1 - October 31, 2026", "periodYear": 2026,
     "totalIncome": 300000, "costOfGoodsSold": None, "grossProfit": 300000,
     "totalExpenses": 186120, "officerCompensation": 80000, "wagesOther": None, "payrollTaxes": 6120,
-    "depreciation": None, "rentExpense": 24000, "interestExpense": None, "netIncome": 113880,
+    "depreciation": None, "rentExpense": 24000, "interestExpense": None,
+    "otherIncome": None, "otherExpenses": None, "netOperatingIncome": 113880, "netIncome": 113880,
 }
 _TAX_1065_FIXTURE_FIELDS = {
     "taxYear": 2025, "partnerCount": 2,
