@@ -60,6 +60,13 @@ def test_prompt_names_every_field_and_forbids_identifiers():
     assert "Never estimate" in p
 
 
+def test_filing_status_is_decided_by_a_mark_or_the_standard_deduction_not_the_label():
+    p = tx._system_prompt("tax-1040-review")
+    assert "do not pick a status just because its label appears" in p
+    assert "15,750 = single" in p and "23,625 = hoh" in p and "21,900 = hoh" in p
+    assert "[checked:" in p
+
+
 # ── privacy ──────────────────────────────────────────────────────────────────
 
 def test_prepare_text_masks_ssns_and_caps_length():

@@ -44,7 +44,7 @@ MAX_TEXT_CHARS = 280_000
 # model reads the right line instead of guessing.
 REVIEW_FIELDS: list[tuple[str, str, str]] = [
     ("taxYear", "integer", "the tax year printed at the top of Form 1040"),
-    ("filingStatus", "string", "Form 1040 filing status box: one of single, mfj, mfs, hoh, qss"),
+    ("filingStatus", "string", "Form 1040 filing status, one of single, mfj, mfs, hoh, qss. The text layer usually lists ALL five labels whether or not their box is checked, so do not pick a status just because its label appears. Decide from (a) an explicit mark next to one label (X, check, 'checked', or a '[checked: ...]' note), or (b) the standard deduction on Form 1040 line 12: 2025 returns 15,750 = single or mfs, 31,500 = mfj or qss, 23,625 = hoh; 2024 returns 14,600 = single or mfs, 29,200 = mfj or qss, 21,900 = hoh (a larger amount means an additional age/blind deduction was added to one of these). A spouse name or a second SSN line means mfj. If (a) and (b) disagree or neither is available, choose by (b) and set confidence to 0.4 or lower"),
     ("dependents", "integer", "number of dependents listed on Form 1040 who are under 17 (child tax credit box checked); 0 if none"),
     ("w2Wages", "number", "Form 1040 line 1a (or line 1z), total wages"),
     ("w2Withheld", "number", "Form 1040 line 25a, federal income tax withheld from W-2s"),
@@ -226,6 +226,8 @@ def _system_prompt(profile: str) -> str:
         "3. confidence is 0 to 1 per field: 1 when the line is unambiguous, lower when the text layer "
         "is garbled, the line is inferred from context, or several candidates exist.\n"
         "4. Return nothing but the JSON object. Do not include names, addresses, or identification numbers.\n"
+        "5. Checkboxes: a label appearing in the text does not mean its box is checked. Only a mark "
+        "beside the label, a '[checked: ...]' note, or a figure elsewhere on the return that implies it counts.\n"
         f"Fields:\n{lines}"
     )
 
